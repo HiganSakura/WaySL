@@ -1,0 +1,16 @@
+[package]
+name = "waysl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+wsl1-system-backend = ["wayland-server/system"]
+
+[dependencies]
+bevy = "0.18.0"
+
+[target.'cfg(unix)'.dependencies]
+wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-server = "0.31"
