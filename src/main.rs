@@ -1,3 +1,4 @@
+mod frame_bridge;
 #[cfg(unix)]
 mod wayland;
 mod wayland_wire;
@@ -9,22 +10,112 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::WindowRef;
 use bevy::window::{ExitCondition, WindowPlugin, WindowResolution};
 use std::collections::HashMap;
-#[cfg(test)]
-use std::io::Write;
-use std::io::{self, Read};
-use std::net::{TcpListener, TcpStream};
+use std::io;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 const DEFAULT_WIDTH: u32 = 960;
 const DEFAULT_HEIGHT: u32 = 540;
+/// Reserved for the placeholder window shown before any Wayland surface arrives.
+/// The compositor hands out surface ids starting at `PLACEHOLDER_SURFACE_ID + 1`.
+const PLACEHOLDER_SURFACE_ID: u64 = 1;
+
+#[cfg(unix)]
+struct WaylandSpec {
+    socket: std::path::PathBuf,
+    forward: Option<String>,
+}
+
+#[cfg(unix)]
+impl WaylandSpec {
+    fn from_environment() -> Self {
+        let socket = std::env::var_os("WAYSL_WAYLAND_SOCKET")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/waysl-wayland-0"));
+        Self {
+            socket,
+            forward: std::env::var("WAYSL_FRAME_FORWARD").ok(),
+        }
+    }
+}
+
+/// Run the standard Wayland compositor without any local window system.
+///
+/// Committed `wl_shm` frames are forwarded to the native Windows renderer over
+/// the internal frame bridge, so no X11 server or XWayland is required.
+#[cfg(unix)]
+fn run_headless_compositor() -> io::Result<()> {
+    let spec = WaylandSpec::from_environment();
+    let WaylandSpec { socket, forward } = spec;
+    let forward = forward.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "WAYSL_FRAME_FORWARD must name the renderer frame bridge address",
+        )
+    })?;
+    let (sender, receiver) = mpsc::channel();
+    let forwarder = thread::spawn(move || forward_frames(receiver, forward));
+    let result = wayland::run_with_sender(&socket, sender);
+    let _ = forwarder.join();
+    result
+}
+
+#[cfg(unix)]
+fn forward_frames(receiver: mpsc::Receiver<wayland::WaylandFrame>, address: String) {
+    let mut writer = FrameBridgeWriter::default();
+    for frame in receiver {
+        if let Err(error) = writer.send(&address, &frame) {
+            eprintln!("WaySL frame forward failed on {address}: {error}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct FrameBridgeWriter {
+    stream: Option<std::net::TcpStream>,
+}
+
+#[cfg(unix)]
+impl FrameBridgeWriter {
+    fn send(&mut self, address: &str, frame: &wayland::WaylandFrame) -> io::Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(std::net::TcpStream::connect(address)?);
+        }
+        let Some(stream) = self.stream.as_mut() else {
+            return Ok(());
+        };
+        if let Err(error) = write_frame(stream, frame) {
+            self.stream = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn write_frame(stream: &mut std::net::TcpStream, frame: &wayland::WaylandFrame) -> io::Result<()> {
+    use std::io::Write;
+
+    let title = frame.title.as_bytes();
+    let mut header = frame_bridge::frame_header(
+        frame.id,
+        frame.width,
+        frame.height,
+        frame.generation,
+        title.len(),
+        frame.pixels.len(),
+    );
+    header.extend_from_slice(title);
+    stream.write_all(&header)?;
+    stream.write_all(&frame.pixels)?;
+    stream.flush()
+}
 
 #[cfg(unix)]
 fn start_wayland_endpoint() -> mpsc::Receiver<wayland::WaylandFrame> {
-    let socket = std::env::var_os("WAYSL_WAYLAND_SOCKET")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/waysl-wayland-0"));
+    let WaylandSpec { socket, .. } = WaylandSpec::from_environment();
     if let Err(error) = std::fs::remove_file(&socket)
         && error.kind() != io::ErrorKind::NotFound
     {
@@ -63,6 +154,15 @@ fn start_windows_wayland_endpoint() {
 }
 
 fn main() {
+    #[cfg(unix)]
+    if std::env::var_os("WAYSL_FRAME_FORWARD").is_some() {
+        if let Err(error) = run_headless_compositor() {
+            eprintln!("WaySL headless compositor stopped: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     #[cfg(windows)]
     start_windows_wayland_endpoint();
 
@@ -101,14 +201,14 @@ fn setup(
     mut waypipe: ResMut<WaypipeProcess>,
 ) {
     registry.upsert(Surface {
-        id: SurfaceId(1),
+        id: SurfaceId(PLACEHOLDER_SURFACE_ID),
         title: "WaySL surface".to_string(),
         width: DEFAULT_WIDTH,
         height: DEFAULT_HEIGHT,
         pixels: checkerboard(DEFAULT_WIDTH, DEFAULT_HEIGHT),
         generation: 1,
     });
-    info!(address = %input.address, "WaySL frame listener ready");
+    info!(address = %input.address, "WaySL frame bridge ready");
     if let Err(error) = waypipe.start() {
         error!(%error, "waypipe was not started; use WAYSL_WAYPIPE_COMMAND to configure it");
     }
@@ -171,18 +271,19 @@ impl SurfaceInput {
             }
         });
 
-        let listener = TcpListener::bind(&address).unwrap_or_else(|error| {
-            panic!("cannot bind WAYSL_LISTEN={address}: {error}");
-        });
+        let frame_receiver = frame_bridge::start_listener(address.clone());
         thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(error) = receive_stream(stream, &sender) {
-                            eprintln!("WaySL frame stream closed: {error}");
-                        }
-                    }
-                    Err(error) => eprintln!("WaySL listener failed: {error}"),
+            for frame in frame_receiver {
+                let surface = Surface {
+                    id: SurfaceId(frame.id),
+                    title: frame.title,
+                    width: frame.width,
+                    height: frame.height,
+                    pixels: frame.pixels,
+                    generation: frame.generation,
+                };
+                if sender.send(surface).is_err() {
+                    break;
                 }
             }
         });
@@ -196,18 +297,19 @@ impl SurfaceInput {
     fn bind_from_environment() -> Self {
         let address = std::env::var("WAYSL_LISTEN").unwrap_or_else(|_| "127.0.0.1:48765".into());
         let (sender, receiver) = mpsc::channel();
-        let listener = TcpListener::bind(&address).unwrap_or_else(|error| {
-            panic!("cannot bind WAYSL_LISTEN={address}: {error}");
-        });
+        let frame_receiver = frame_bridge::start_listener(address.clone());
         thread::spawn(move || {
-            for stream in listener.incoming() {
-                match stream {
-                    Ok(stream) => {
-                        if let Err(error) = receive_stream(stream, &sender) {
-                            eprintln!("WaySL frame stream closed: {error}");
-                        }
-                    }
-                    Err(error) => eprintln!("WaySL listener failed: {error}"),
+            for frame in frame_receiver {
+                let surface = Surface {
+                    id: SurfaceId(frame.id),
+                    title: frame.title,
+                    width: frame.width,
+                    height: frame.height,
+                    pixels: frame.pixels,
+                    generation: frame.generation,
+                };
+                if sender.send(surface).is_err() {
+                    break;
                 }
             }
         });
@@ -224,63 +326,16 @@ fn receive_surface_frames(mut registry: ResMut<SurfaceRegistry>, input: Res<Surf
         .lock()
         .expect("WaySL frame receiver poisoned");
     while let Ok(surface) = receiver.try_recv() {
+        info!(
+            id = surface.id.0,
+            title = %surface.title,
+            width = surface.width,
+            height = surface.height,
+            bytes = surface.pixels.len(),
+            "received frame"
+        );
         registry.upsert(surface);
     }
-}
-
-fn receive_stream(mut stream: TcpStream, sender: &mpsc::Sender<Surface>) -> io::Result<()> {
-    const MAGIC: &[u8; 4] = b"WSL1";
-    const MAX_TITLE: u32 = 4096;
-    const MAX_PIXELS: u32 = 256 * 1024 * 1024;
-    loop {
-        let mut magic = [0; 4];
-        stream.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid WaySL frame magic",
-            ));
-        }
-        let width = read_u32(&mut stream)?;
-        let height = read_u32(&mut stream)?;
-        let id = read_u64(&mut stream)?;
-        let generation = read_u64(&mut stream)?;
-        let title_len = read_u32(&mut stream)?;
-        let pixel_len = read_u32(&mut stream)?;
-        if title_len > MAX_TITLE || pixel_len > MAX_PIXELS || width == 0 || height == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid WaySL frame dimensions",
-            ));
-        }
-        let mut title_bytes = vec![0; title_len as usize];
-        stream.read_exact(&mut title_bytes)?;
-        let mut pixels = vec![0; pixel_len as usize];
-        stream.read_exact(&mut pixels)?;
-        sender
-            .send(Surface {
-                id: SurfaceId(id),
-                title: String::from_utf8(title_bytes)
-                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid title"))?,
-                width,
-                height,
-                pixels,
-                generation,
-            })
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "WaySL receiver stopped"))?;
-    }
-}
-
-fn read_u32(stream: &mut TcpStream) -> io::Result<u32> {
-    let mut bytes = [0; 4];
-    stream.read_exact(&mut bytes)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_u64(stream: &mut TcpStream) -> io::Result<u64> {
-    let mut bytes = [0; 8];
-    stream.read_exact(&mut bytes)?;
-    Ok(u64::from_le_bytes(bytes))
 }
 
 #[derive(Component)]
@@ -418,36 +473,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn receives_one_frame() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-        let address = listener.local_addr().expect("address");
-        let sender = thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("connect");
-            let title = b"ok";
-            let pixels = [1, 2, 3, 4];
-            let mut frame = Vec::new();
-            frame.extend_from_slice(b"WSL1");
-            frame.extend_from_slice(&2u32.to_le_bytes());
-            frame.extend_from_slice(&1u32.to_le_bytes());
-            frame.extend_from_slice(&7u64.to_le_bytes());
-            frame.extend_from_slice(&1u64.to_le_bytes());
-            frame.extend_from_slice(&(title.len() as u32).to_le_bytes());
-            frame.extend_from_slice(&(pixels.len() as u32).to_le_bytes());
-            frame.extend_from_slice(title);
-            frame.extend_from_slice(&pixels);
-            stream.write_all(&frame).expect("frame");
+    fn surfaces_upsert_by_id() {
+        let mut registry = SurfaceRegistry::default();
+        registry.upsert(Surface {
+            id: SurfaceId(3),
+            title: "first".to_string(),
+            width: 8,
+            height: 4,
+            pixels: vec![0; 8 * 4 * 4],
+            generation: 1,
         });
-        let (stream, _) = listener.accept().expect("accept");
-        let (frame_sender, frame_receiver) = mpsc::channel();
-        let _ = receive_stream(stream, &frame_sender);
-        let frame = frame_receiver.recv().expect("frame receiver");
-        assert_eq!(frame.id, SurfaceId(7));
-        assert_eq!(frame.title, "ok");
-        assert_eq!(frame.pixels, pixels_for_test());
-        sender.join().expect("sender");
-    }
-
-    fn pixels_for_test() -> Vec<u8> {
-        vec![1, 2, 3, 4]
+        registry.upsert(Surface {
+            id: SurfaceId(3),
+            title: "second".to_string(),
+            width: 8,
+            height: 4,
+            pixels: vec![0; 8 * 4 * 4],
+            generation: 2,
+        });
+        assert_eq!(registry.surfaces.len(), 1);
+        assert_eq!(registry.surfaces[&SurfaceId(3)].title, "second");
     }
 }
