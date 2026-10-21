@@ -185,15 +185,18 @@ Verified in this repository:
   build with an unlinked-tempfile fallback gets further, but WSL1's
   ancillary-data handling still makes long sessions fragile.
 
-Screenshot evidence: `waysl-headless-e2e.png` was captured from the Windows
-desktop during the run above.
+Screenshot evidence: `waysl-windows-client.png` is a capture of the
+`WaySL-Windows` client window from the Windows desktop during that run. It is a
+640x360 image containing the smoke client's blue gradient (65,536 distinct
+colours), so the forwarded frame reaches the screen.
 
 Known gaps:
 
-- The renderer received frames and created Bevy windows, but the automation in
-  this environment could not confirm the window pixels on the interactive
-  desktop: the SSH shell runs in a service window station, so its enumeration
-  and screen capture only see that station. Confirm visually on a real desktop.
+- The renderer paints with a plain `Camera2d` and sprite. Custom projections,
+  render layers, and non-zero transforms did not paint on the software D3D12
+  adapter used in testing, so that configuration is kept deliberately minimal.
+- Desktop capture requires an active interactive session; a disconnected RDP
+  session captures as a single flat colour and must not be read as evidence.
 - Pixel transport over the Windows TCP Wayland endpoint.
 - Wayland protocols beyond `wl_compositor`, `wl_shm` and `xdg-shell`
   (`wl_seat`, `xdg_decoration`, `wp_viewporter`, fractional scaling, …).
