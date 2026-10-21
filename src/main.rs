@@ -341,9 +341,6 @@ fn receive_surface_frames(mut registry: ResMut<SurfaceRegistry>, input: Res<Surf
 #[derive(Component)]
 struct SurfaceWindow;
 
-#[derive(Component)]
-struct SurfaceSprite;
-
 fn sync_surface_windows(
     mut commands: Commands,
     mut registry: ResMut<SurfaceRegistry>,
@@ -362,14 +359,14 @@ fn sync_surface_windows(
             continue;
         }
 
-        let image = images.add(Image::new_fill(
+        let image = images.add(Image::new(
             Extent3d {
                 width: surface.width,
                 height: surface.height,
                 depth_or_array_layers: 1,
             },
             TextureDimension::D2,
-            &surface.pixels,
+            surface.pixels.clone(),
             TextureFormat::Rgba8UnormSrgb,
             RenderAssetUsages::default(),
         ));
@@ -383,18 +380,21 @@ fn sync_surface_windows(
                 SurfaceWindow,
             ))
             .id();
+        // Keep this identical to the verified sprite-probe configuration:
+        // a plain `Camera2d` targeting the window, and one sprite sized to the
+        // surface. Custom projections, render layers, and non-zero transforms
+        // each failed to paint on the software D3D12 adapter.
+        let width = surface.width as f32;
+        let height = surface.height as f32;
         commands.spawn((
             Camera2d,
             RenderTarget::Window(WindowRef::Entity(window_entity)),
         ));
-        commands.spawn((
-            Sprite {
-                image: image.clone(),
-                custom_size: Some(Vec2::new(surface.width as f32, surface.height as f32)),
-                ..default()
-            },
-            SurfaceSprite,
-        ));
+        commands.spawn(Sprite {
+            image: image.clone(),
+            custom_size: Some(Vec2::new(width, height)),
+            ..default()
+        });
         registry.windows.insert(surface.id, window_entity);
         registry.images.insert(surface.id, image);
         registry.generations.insert(surface.id, surface.generation);
