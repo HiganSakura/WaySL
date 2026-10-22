@@ -1,4 +1,8 @@
-//! Minimal standard Wayland endpoint with wl_shm surface import.
+//! Standard Wayland compositor endpoint with `wl_shm` and `xdg-shell`.
+//!
+//! Only standard protocols are used: `wl_compositor`, `wl_shm` and
+//! `xdg_wm_base`. Committed shared-memory buffers are converted to tightly
+//! packed RGBA and delivered as [`WaylandFrame`] values.
 #![cfg(unix)]
 
 use std::io;
@@ -6,30 +10,48 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_region, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
+    wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
 };
 
+/// Surface ids start here so id `1` stays free for the renderer placeholder.
 static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(2);
 
+/// Logical output width advertised through `wl_output`.
+const DEFAULT_OUTPUT_WIDTH: i32 = 1920;
+/// Logical output height advertised through `wl_output`.
+const DEFAULT_OUTPUT_HEIGHT: i32 = 1080;
+/// Refresh rate advertised through `wl_output`, in mHz.
+const DEFAULT_OUTPUT_REFRESH_MHZ: i32 = 60_000;
+
+/// One committed `wl_shm` surface, converted to RGBA8.
 #[derive(Debug, Clone)]
 pub struct WaylandFrame {
+    /// Surface id.
     pub id: u64,
+    /// Title from `xdg_toplevel.set_title`, if any.
     pub title: String,
+    /// Pixel width.
     pub width: u32,
+    /// Pixel height.
     pub height: u32,
+    /// Tightly packed RGBA8 pixels.
     pub pixels: Vec<u8>,
+    /// Increments on every committed buffer.
     pub generation: u64,
 }
 
+/// Per-client state shared across all dispatch implementations.
 #[derive(Default)]
 pub struct WaylandState {
     sender: Option<mpsc::Sender<WaylandFrame>>,
@@ -46,6 +68,13 @@ pub fn run_with_sender(
     handle.create_global::<WaylandState, wl_compositor::WlCompositor, ()>(4, ());
     handle.create_global::<WaylandState, wl_shm::WlShm, ()>(1, ());
     handle.create_global::<WaylandState, xdg_wm_base::XdgWmBase, ()>(6, ());
+    handle.create_global::<WaylandState, wl_seat::WlSeat, ()>(7, ());
+    handle.create_global::<WaylandState, wl_output::WlOutput, ()>(3, ());
+    handle
+        .create_global::<WaylandState, zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()>(
+            1,
+            (),
+        );
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
     let mut state = WaylandState {
@@ -95,6 +124,23 @@ impl ShmPool {
         Ok(Self { fd, ptr, len })
     }
 
+    /// Remaps the pool so it covers at least `size` bytes.
+    ///
+    /// The backing file is resized by the client through `wl_shm_pool.resize`;
+    /// the mapping must grow with it or later buffers read out of range.
+    fn resize(&mut self, size: i32) -> io::Result<()> {
+        let size = usize::try_from(size)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "negative pool size"))?;
+        if size <= self.len {
+            return Ok(());
+        }
+        let ptr = unsafe { mmap_read_write(self.fd.as_raw_fd(), size)? };
+        unsafe { munmap(self.ptr, self.len) };
+        self.ptr = ptr;
+        self.len = size;
+        Ok(())
+    }
+
     fn bytes(&self, offset: i32, len: usize) -> Option<&[u8]> {
         let offset = usize::try_from(offset).ok()?;
         let end = offset.checked_add(len)?;
@@ -111,7 +157,7 @@ impl Drop for ShmPool {
 
 #[derive(Clone)]
 struct BufferData {
-    pool: Arc<ShmPool>,
+    pool: Arc<RwLock<ShmPool>>,
     offset: i32,
     width: i32,
     height: i32,
@@ -201,7 +247,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
         match request {
             wl_shm::Request::CreatePool { id, fd, size } => {
                 if let Ok(pool) = ShmPool::new(fd, size) {
-                    init.init(id, Arc::new(pool));
+                    init.init(id, Arc::new(RwLock::new(pool)));
                 }
             }
             _ => unreachable!("wl_shm protocol request is covered"),
@@ -209,13 +255,13 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
     }
 }
 
-impl Dispatch<wl_shm_pool::WlShmPool, Arc<ShmPool>> for WaylandState {
+impl Dispatch<wl_shm_pool::WlShmPool, Arc<RwLock<ShmPool>>> for WaylandState {
     fn request(
         _: &mut Self,
         _: &Client,
         pool: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
-        data: &Arc<ShmPool>,
+        data: &Arc<RwLock<ShmPool>>,
         _: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
@@ -250,7 +296,11 @@ impl Dispatch<wl_shm_pool::WlShmPool, Arc<ShmPool>> for WaylandState {
                 let _ = pool;
             }
             wl_shm_pool::Request::Resize { size } => {
-                let _ = size;
+                // A failed remap leaves the pool at its old size; later
+                // buffers outside it fail validation in `copy_buffer`.
+                if let Ok(mut mapping) = data.write() {
+                    let _ = mapping.resize(size);
+                }
             }
             _ => unreachable!("wl_shm_pool protocol request is covered"),
         }
@@ -305,13 +355,17 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                         });
                     }
                     buffer.release();
-                    let timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u32;
-                    for callback in data.callbacks.drain(..) {
-                        callback.done(timestamp);
-                    }
+                }
+                // Every commit completes any pending frame callbacks, even when
+                // no new buffer was attached. Otherwise a client that commits
+                // after a configure (no buffer yet) would wait forever for
+                // `wl_callback.done` and stop rendering.
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u32;
+                for callback in data.callbacks.drain(..) {
+                    callback.done(timestamp);
                 }
             }
             wl_surface::Request::Destroy => {
@@ -356,6 +410,171 @@ impl Dispatch<wl_region::WlRegion, ()> for WaylandState {
             wl_region::Request::Add { .. }
             | wl_region::Request::Subtract { .. }
             | wl_region::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wl_seat: advertise pointer and keyboard so toolkits create an input-capable
+// window. Neither device sends events yet; they exist so toolkits such as
+// winit can bind and create their global state.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<wl_seat::WlSeat>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        let seat = init.init(resource, ());
+        seat.capabilities(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard);
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
+    fn request(
+        state: &mut Self,
+        _: &Client,
+        _: &wl_seat::WlSeat,
+        request: wl_seat::Request,
+        _: &(),
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wl_seat::Request::GetPointer { id } => {
+                init.init(id, ());
+            }
+            wl_seat::Request::GetKeyboard { id } => {
+                init.init(id, ());
+            }
+            wl_seat::Request::GetTouch { .. } | wl_seat::Request::Release => {}
+            _ => {
+                let _ = state.next_serial;
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_pointer::WlPointer,
+        request: wl_pointer::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // Clients may request a cursor surface; we ignore it until input is
+        // forwarded from the Windows side.
+        let _ = request;
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_keyboard::WlKeyboard,
+        request: wl_keyboard::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        let _ = request;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// wl_output: one logical output sized like the renderer's default surface.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<wl_output::WlOutput, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<wl_output::WlOutput>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        let output = init.init(resource, ());
+        output.geometry(
+            0,
+            0,
+            0,
+            0,
+            wl_output::Subpixel::Unknown,
+            "WaySL".to_string(),
+            "WaySL virtual output".to_string(),
+            wl_output::Transform::Normal,
+        );
+        output.mode(
+            wl_output::Mode::Current | wl_output::Mode::Preferred,
+            DEFAULT_OUTPUT_WIDTH,
+            DEFAULT_OUTPUT_HEIGHT,
+            DEFAULT_OUTPUT_REFRESH_MHZ,
+        );
+        output.scale(1);
+        output.name("WAYSL-1".to_string());
+        output.description("WaySL virtual output".to_string());
+        output.done();
+    }
+}
+
+impl Dispatch<wl_output::WlOutput, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_output::WlOutput,
+        request: wl_output::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        let _ = request;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zxdg_toplevel_decoration_v1: the renderer draws no native decorations, so
+// clients are asked to draw their own.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        init.init(resource, ());
+    }
+}
+
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        decoration: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        request: zxdg_toplevel_decoration_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zxdg_toplevel_decoration_v1::Request::SetMode { .. } => {
+                decoration.configure(zxdg_toplevel_decoration_v1::Mode::ClientSide);
+            }
+            zxdg_toplevel_decoration_v1::Request::UnsetMode
+            | zxdg_toplevel_decoration_v1::Request::Destroy => {}
             _ => {}
         }
     }
@@ -484,7 +703,8 @@ fn copy_buffer(data: &BufferData) -> Option<Vec<u8>> {
     let width = usize::try_from(data.width).ok()?;
     let height = usize::try_from(data.height).ok()?;
     let source_len = stride.checked_mul(height)?;
-    let source = data.pool.bytes(data.offset, source_len)?;
+    let pool = data.pool.read().ok()?;
+    let source = pool.bytes(data.offset, source_len)?;
     let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
     for y in 0..height {
         for x in 0..width {

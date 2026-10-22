@@ -12,5 +12,5 @@ wsl1-system-backend = ["wayland-server/system"]
 bevy = "0.18.0"
 
 [target.'cfg(unix)'.dependencies]
-wayland-protocols = { version = "0.32", features = ["server"] }
+wayland-protocols = { version = "0.32", features = ["server", "unstable"] }
 wayland-server = "0.31"
