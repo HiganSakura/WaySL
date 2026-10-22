@@ -78,9 +78,18 @@ pub fn run_with_sender(
             1,
             (),
         );
-    handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()>(4, ());
+    // Bind before probing: `eglGetDisplay` may consult WAYLAND_DISPLAY and block
+    // trying to reach a compositor, and this compositor is that socket.
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
+
+    // Only advertise dmabuf when the host can actually back it with a GPU.
+    // Offering it blind would send clients down a path that fails at import.
+    let gpu = crate::egl::probe();
+    eprintln!("WaySL GPU path: {}", gpu.describe());
+    if gpu.is_ready() {
+        handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()>(4, ());
+    }
     let mut state = WaylandState {
         sender: Some(sender),
         next_serial: 0,

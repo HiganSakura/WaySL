@@ -18,6 +18,9 @@ pub mod renderer;
 pub mod compositor;
 
 #[cfg(unix)]
+pub mod egl;
+
+#[cfg(unix)]
 pub mod wayland;
 
 pub mod wayland_wire;
