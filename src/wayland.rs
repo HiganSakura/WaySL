@@ -356,8 +356,10 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
             wl_compositor::Request::CreateRegion { id } => {
                 init.init(id, ());
             }
-            _ => {} // An opcode outside the version we advertise is a client bug;
-                    // ignoring it keeps other clients alive.
+            // An opcode outside the version we advertise is a client bug.
+            // Ignoring it keeps other clients alive, but it is worth surfacing
+            // because it usually means a protocol mismatch.
+            other => eprintln!("[waysl] ignoring unsupported request: {other:?}"),
         }
     }
 }
@@ -446,8 +448,10 @@ impl Dispatch<wl_shm_pool::WlShmPool, Arc<RwLock<ShmPool>>> for WaylandState {
                     let _ = mapping.resize(size);
                 }
             }
-            _ => {} // An opcode outside the version we advertise is a client bug;
-                    // ignoring it keeps other clients alive.
+            // An opcode outside the version we advertise is a client bug.
+            // Ignoring it keeps other clients alive, but it is worth surfacing
+            // because it usually means a protocol mismatch.
+            other => eprintln!("[waysl] ignoring unsupported request: {other:?}"),
         }
     }
 }
@@ -522,8 +526,10 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
             | wl_surface::Request::SetBufferTransform { .. }
             | wl_surface::Request::SetBufferScale { .. }
             | wl_surface::Request::Offset { .. } => {}
-            _ => {} // An opcode outside the version we advertise is a client bug;
-                    // ignoring it keeps other clients alive.
+            // An opcode outside the version we advertise is a client bug.
+            // Ignoring it keeps other clients alive, but it is worth surfacing
+            // because it usually means a protocol mismatch.
+            other => eprintln!("[waysl] ignoring unsupported request: {other:?}"),
         }
     }
 }
@@ -762,8 +768,10 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
             xdg_wm_base::Request::Destroy => {
                 let _ = base;
             }
-            _ => {} // An opcode outside the version we advertise is a client bug;
-                    // ignoring it keeps other clients alive.
+            // An opcode outside the version we advertise is a client bug.
+            // Ignoring it keeps other clients alive, but it is worth surfacing
+            // because it usually means a protocol mismatch.
+            other => eprintln!("[waysl] ignoring unsupported request: {other:?}"),
         }
     }
 }
@@ -793,8 +801,10 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
             xdg_surface::Request::Destroy => {
                 let _ = surface;
             }
-            _ => {} // An opcode outside the version we advertise is a client bug;
-                    // ignoring it keeps other clients alive.
+            // An opcode outside the version we advertise is a client bug.
+            // Ignoring it keeps other clients alive, but it is worth surfacing
+            // because it usually means a protocol mismatch.
+            other => eprintln!("[waysl] ignoring unsupported request: {other:?}"),
         }
     }
 }
@@ -827,7 +837,9 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
             | xdg_toplevel::Request::Resize { .. }
             | xdg_toplevel::Request::ShowWindowMenu { .. }
             | xdg_toplevel::Request::Destroy => {}
-            _ => {}
+            // Same rationale as elsewhere: never abort the compositor over one
+            // client's stray opcode, but do not hide it either.
+            other => eprintln!("[waysl] ignoring unsupported xdg_toplevel request: {other:?}"),
         }
     }
 }
@@ -1053,6 +1065,12 @@ fn record_and_build(
     height: i32,
     format: u32,
 ) -> Option<DmabufImage> {
+    // Only the layouts we advertise can be rasterised. Anything else would be
+    // reinterpreted as 32-bit RGBA and render as garbage, so reject it here and
+    // let the client fall back to wl_shm.
+    if !FEEDBACK_FORMATS.contains(&format) {
+        return None;
+    }
     let mut params = data.lock().ok()?;
     params.width = width;
     params.height = height;
@@ -1224,6 +1242,16 @@ mod tests {
             }
             .is_opaque()
         );
+    }
+
+    #[test]
+    fn unsupported_dmabuf_format_is_rejected() {
+        // A client may import any fourcc, but only the advertised 32-bit
+        // layouts can be rasterised; anything else must be refused rather than
+        // silently reinterpreted as RGBA.
+        let params = Arc::new(Mutex::new(DmabufParams::default()));
+        assert!(record_and_build(&params, 4, 4, u32::from_le_bytes(*b"YU12")).is_none());
+        assert!(record_and_build(&params, 4, 4, DRM_FORMAT_ARGB8888).is_none());
     }
 
     #[test]
