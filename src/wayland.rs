@@ -14,6 +14,9 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use wayland_protocols::wp::linux_dmabuf::zv1::server::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::protocol::{
@@ -75,6 +78,7 @@ pub fn run_with_sender(
             1,
             (),
         );
+    handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()>(4, ());
     let listener = UnixListener::bind(socket_path)?;
     listener.set_nonblocking(true)?;
     let mut state = WaylandState {
@@ -157,12 +161,139 @@ impl Drop for ShmPool {
 
 #[derive(Clone)]
 struct BufferData {
-    pool: Arc<RwLock<ShmPool>>,
-    offset: i32,
+    storage: BufferStorage,
     width: i32,
     height: i32,
     stride: i32,
-    format: wl_shm::Format,
+    format: BufferFormat,
+}
+
+/// Where a buffer's pixels live.
+#[derive(Clone)]
+enum BufferStorage {
+    /// Shared memory imported through `wl_shm.create_pool`.
+    Shm {
+        pool: Arc<RwLock<ShmPool>>,
+        offset: i32,
+    },
+    /// A dma-buf imported through `zwp_linux_buffer_params_v1`.
+    Dmabuf(Arc<DmabufImage>),
+}
+
+/// Pixel layout of a buffer, independent of which protocol created it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BufferFormat {
+    Shm(wl_shm::Format),
+    /// DRM fourcc with optional per-channel byte padding.
+    Drm {
+        fourcc: u32,
+        modifier: u64,
+    },
+}
+
+impl BufferFormat {
+    /// Whether the alpha channel must be forced opaque (XRGB-style formats).
+    fn is_opaque(self) -> bool {
+        match self {
+            BufferFormat::Shm(format) => format == wl_shm::Format::Xrgb8888,
+            BufferFormat::Drm { fourcc, .. } => matches!(fourcc, 0 | DRM_FORMAT_XRGB8888),
+        }
+    }
+}
+
+/// DRM fourcc for 32-bit XRGB, which is also what `wl_drm`/dmabuf use here.
+const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
+/// DRM fourcc for 32-bit ARGB.
+const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+
+/// One imported dma-buf plane set, kept alive for the lifetime of its buffer.
+struct DmabufImage {
+    width: i32,
+    height: i32,
+    stride: i32,
+    fourcc: u32,
+    mapping: Vec<u8>,
+}
+
+impl DmabufImage {
+    /// Reads the plane back into tightly packed RGBA8.
+    ///
+    /// dma-buf contents are only reachable through a mapping; `mmap` is
+    /// attempted here and, when it fails, the import is rejected so clients
+    /// can fall back to `wl_shm` instead of receiving a corrupt frame.
+    fn to_rgba(&self) -> Option<Vec<u8>> {
+        let width = usize::try_from(self.width).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        let stride = usize::try_from(self.stride).ok()?;
+        let needle = stride.checked_mul(height)?;
+        if self.mapping.len() < needle {
+            return None;
+        }
+        let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
+        let opaque = matches!(self.fourcc, 0 | DRM_FORMAT_XRGB8888);
+        for y in 0..height {
+            for x in 0..width {
+                let source = y * stride + x * 4;
+                let target = (y * width + x) * 4;
+                if source + 4 > self.mapping.len() {
+                    return None;
+                }
+                let b = self.mapping[source];
+                let g = self.mapping[source + 1];
+                let r = self.mapping[source + 2];
+                pixels[target..target + 3].copy_from_slice(&[r, g, b]);
+                pixels[target + 3] = if opaque {
+                    0xff
+                } else {
+                    self.mapping[source + 3]
+                };
+            }
+        }
+        Some(pixels)
+    }
+}
+
+/// Pending `zwp_linux_buffer_params_v1`, populated plane by plane.
+#[derive(Default)]
+struct DmabufParams {
+    planes: Vec<DmabufPlane>,
+    width: i32,
+    height: i32,
+    format: u32,
+    modifier: u64,
+}
+
+struct DmabufPlane {
+    fd: OwnedFd,
+    offset: u32,
+    stride: u32,
+}
+
+impl DmabufParams {
+    /// Maps the accumulated planes into an image.
+    ///
+    /// Only single-plane 32-bit formats are rasterised; anything else is
+    /// rejected so the client can pick a supported alternative.
+    fn build(&self) -> Option<DmabufImage> {
+        let plane = self.planes.first()?;
+        let stride = i32::try_from(plane.stride).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        let stride_usize = usize::try_from(plane.stride).ok()?;
+        let offset = usize::try_from(plane.offset).ok()?;
+        let len = stride_usize.checked_mul(height)?.checked_add(offset)?;
+        let mapping = unsafe {
+            let ptr = mmap_read_write(plane.fd.as_raw_fd(), len).ok()?;
+            let slice = std::slice::from_raw_parts(ptr, len);
+            slice[offset..].to_vec()
+        };
+        Some(DmabufImage {
+            width: self.width,
+            height: self.height,
+            stride,
+            fourcc: self.format,
+            mapping,
+        })
+    }
 }
 
 #[derive(Default)]
@@ -282,12 +413,14 @@ impl Dispatch<wl_shm_pool::WlShmPool, Arc<RwLock<ShmPool>>> for WaylandState {
                     init.init(
                         id,
                         BufferData {
-                            pool: data.clone(),
-                            offset,
+                            storage: BufferStorage::Shm {
+                                pool: data.clone(),
+                                offset,
+                            },
                             width,
                             height,
                             stride,
-                            format,
+                            format: BufferFormat::Shm(format),
                         },
                     );
                 }
@@ -699,29 +832,35 @@ impl Dispatch<xdg_popup::XdgPopup, ()> for WaylandState {
 }
 
 fn copy_buffer(data: &BufferData) -> Option<Vec<u8>> {
-    let stride = usize::try_from(data.stride).ok()?;
     let width = usize::try_from(data.width).ok()?;
     let height = usize::try_from(data.height).ok()?;
-    let source_len = stride.checked_mul(height)?;
-    let pool = data.pool.read().ok()?;
-    let source = pool.bytes(data.offset, source_len)?;
-    let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
-    for y in 0..height {
-        for x in 0..width {
-            let source_index = y * stride + x * 4;
-            let target_index = (y * width + x) * 4;
-            let b = source[source_index];
-            let g = source[source_index + 1];
-            let r = source[source_index + 2];
-            pixels[target_index..target_index + 3].copy_from_slice(&[r, g, b]);
-            pixels[target_index + 3] = if data.format == wl_shm::Format::Xrgb8888 {
-                0xff
-            } else {
-                source[source_index + 3]
-            };
+    match &data.storage {
+        BufferStorage::Shm { pool, offset } => {
+            let stride = usize::try_from(data.stride).ok()?;
+            let source_len = stride.checked_mul(height)?;
+            let pool = pool.read().ok()?;
+            let source = pool.bytes(*offset, source_len)?;
+            let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
+            let opaque = data.format.is_opaque();
+            for y in 0..height {
+                for x in 0..width {
+                    let source_index = y * stride + x * 4;
+                    let target_index = (y * width + x) * 4;
+                    let b = source[source_index];
+                    let g = source[source_index + 1];
+                    let r = source[source_index + 2];
+                    pixels[target_index..target_index + 3].copy_from_slice(&[r, g, b]);
+                    pixels[target_index + 3] = if opaque {
+                        0xff
+                    } else {
+                        source[source_index + 3]
+                    };
+                }
+            }
+            Some(pixels)
         }
+        BufferStorage::Dmabuf(image) => image.to_rgba(),
     }
-    Some(pixels)
 }
 
 unsafe fn mmap_read_write(fd: i32, len: usize) -> io::Result<*mut u8> {
@@ -761,5 +900,239 @@ unsafe fn munmap(ptr: *mut u8, len: usize) {
     }
     unsafe {
         let _ = munmap(ptr, len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// zwp_linux_dmabuf_v1: GPU buffers for clients that can provide them.
+//
+// Clients still receive `wl_shm` as a guaranteed fallback, so offering dmabuf
+// never makes a client unusable. Imports that cannot be mapped are rejected and
+// the client keeps working through shared memory.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        let dmabuf = init.init(resource, ());
+        // Advertise the single-plane 32-bit layouts this compositor can read.
+        for fourcc in [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888] {
+            dmabuf.modifier(fourcc, 0, 0);
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        request: zwp_linux_dmabuf_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zwp_linux_dmabuf_v1::Request::CreateParams { params_id } => {
+                init.init(params_id, Arc::new(Mutex::new(DmabufParams::default())));
+            }
+            zwp_linux_dmabuf_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, Arc<Mutex<DmabufParams>>>
+    for WaylandState
+{
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        params: &zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+        request: zwp_linux_buffer_params_v1::Request,
+        data: &Arc<Mutex<DmabufParams>>,
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            zwp_linux_buffer_params_v1::Request::Add {
+                fd,
+                plane_idx,
+                offset,
+                stride,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                let modifier = (u64::from(modifier_hi) << 32) | u64::from(modifier_lo);
+                if let Ok(mut params) = data.lock() {
+                    params.modifier = modifier;
+                    // Planes may arrive out of order, so honour `plane_idx`
+                    // rather than relying on call order.
+                    let index = plane_idx as usize;
+                    params
+                        .planes
+                        .insert(plane_idx as usize, DmabufPlane { fd, offset, stride });
+                    let _ = index;
+                }
+            }
+            zwp_linux_buffer_params_v1::Request::Create {
+                width,
+                height,
+                format,
+                ..
+            } => {
+                // The deferred form must answer with `created(buffer)` or
+                // `failed`. Without a buffer id there is nothing to report, so
+                // treat it as an unsupported import.
+                match record_and_build(data, width, height, format) {
+                    Some(_) => {
+                        // A successful import still needs a buffer to hand back;
+                        // this compositor only supports the immediate form.
+                        params.failed();
+                    }
+                    None => params.failed(),
+                }
+            }
+            zwp_linux_buffer_params_v1::Request::CreateImmed {
+                buffer_id,
+                width,
+                height,
+                format,
+                ..
+            } => match record_and_build(data, width, height, format) {
+                Some(image) => {
+                    let buffer_data = BufferData {
+                        stride: image.stride,
+                        storage: BufferStorage::Dmabuf(Arc::new(image)),
+                        width,
+                        height,
+                        format: BufferFormat::Drm {
+                            fourcc: format,
+                            modifier: 0,
+                        },
+                    };
+                    init.init(buffer_id, buffer_data);
+                }
+                None => params.failed(),
+            },
+            zwp_linux_buffer_params_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+/// Stores geometry on the params and maps the accumulated planes.
+fn record_and_build(
+    data: &Arc<Mutex<DmabufParams>>,
+    width: i32,
+    height: i32,
+    format: u32,
+) -> Option<DmabufImage> {
+    let mut params = data.lock().ok()?;
+    params.width = width;
+    params.height = height;
+    params.format = format;
+    params.build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an ARGB8888 image whose pixel at (x, y) has known channel values.
+    fn dmabuf(width: i32, height: i32, stride: i32, fourcc: u32, alpha: u8) -> DmabufImage {
+        let mut mapping = vec![0u8; (stride * height) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let at = (y * stride + x * 4) as usize;
+                mapping[at] = 10; // blue
+                mapping[at + 1] = 20; // green
+                mapping[at + 2] = 30; // red
+                mapping[at + 3] = alpha;
+            }
+        }
+        DmabufImage {
+            width,
+            height,
+            stride,
+            fourcc,
+            mapping,
+        }
+    }
+
+    #[test]
+    fn dmabuf_argb_preserves_alpha() {
+        let image = dmabuf(2, 1, 8, DRM_FORMAT_ARGB8888, 0x80);
+        let pixels = image.to_rgba().expect("convert");
+        assert_eq!(pixels.len(), 8);
+        assert_eq!(&pixels[0..4], &[30, 20, 10, 0x80]);
+    }
+
+    #[test]
+    fn dmabuf_xrgb_forces_opaque() {
+        // XRGB has no meaningful alpha; the compositor must not show it through.
+        let image = dmabuf(2, 1, 8, DRM_FORMAT_XRGB8888, 0x00);
+        let pixels = image.to_rgba().expect("convert");
+        assert_eq!(pixels[3], 0xff);
+        assert_eq!(pixels[7], 0xff);
+    }
+
+    #[test]
+    fn dmabuf_honours_stride_padding() {
+        // A stride wider than the pixels must be skipped, not treated as data.
+        let image = dmabuf(1, 2, 16, DRM_FORMAT_XRGB8888, 0xff);
+        let pixels = image.to_rgba().expect("convert");
+        assert_eq!(pixels.len(), 8);
+        assert_eq!(&pixels[0..3], &[30, 20, 10]);
+        assert_eq!(&pixels[4..7], &[30, 20, 10]);
+    }
+
+    #[test]
+    fn dmabuf_rejects_short_mapping() {
+        let image = DmabufImage {
+            width: 4,
+            height: 4,
+            stride: 16,
+            fourcc: DRM_FORMAT_XRGB8888,
+            mapping: vec![0; 8],
+        };
+        assert!(image.to_rgba().is_none());
+    }
+
+    #[test]
+    fn buffer_format_opacity_matches_layout() {
+        assert!(BufferFormat::Shm(wl_shm::Format::Xrgb8888).is_opaque());
+        assert!(!BufferFormat::Shm(wl_shm::Format::Argb8888).is_opaque());
+        assert!(
+            BufferFormat::Drm {
+                fourcc: DRM_FORMAT_XRGB8888,
+                modifier: 0
+            }
+            .is_opaque()
+        );
+        assert!(
+            !BufferFormat::Drm {
+                fourcc: DRM_FORMAT_ARGB8888,
+                modifier: 0
+            }
+            .is_opaque()
+        );
+    }
+
+    #[test]
+    fn dmabuf_params_without_planes_cannot_build() {
+        let params = DmabufParams {
+            width: 4,
+            height: 4,
+            format: DRM_FORMAT_ARGB8888,
+            ..DmabufParams::default()
+        };
+        assert!(params.build().is_none());
     }
 }
