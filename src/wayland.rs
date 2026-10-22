@@ -6,7 +6,7 @@
 #![cfg(unix)]
 
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::io::Write as _;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
-    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -23,6 +24,7 @@ use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
     wl_shm, wl_shm_pool, wl_surface,
 };
+
 use wayland_server::{
     Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource,
 };
@@ -205,7 +207,7 @@ impl BufferFormat {
     fn is_opaque(self) -> bool {
         match self {
             BufferFormat::Shm(format) => format == wl_shm::Format::Xrgb8888,
-            BufferFormat::Drm { fourcc, .. } => matches!(fourcc, 0 | DRM_FORMAT_XRGB8888),
+            BufferFormat::Drm { fourcc, .. } => fourcc == DRM_FORMAT_XRGB8888,
         }
     }
 }
@@ -354,7 +356,8 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
             wl_compositor::Request::CreateRegion { id } => {
                 init.init(id, ());
             }
-            _ => unreachable!("wl_compositor protocol request is covered"),
+            _ => {} // An opcode outside the version we advertise is a client bug;
+                    // ignoring it keeps other clients alive.
         }
     }
 }
@@ -384,13 +387,12 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
         _: &DisplayHandle,
         init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wl_shm::Request::CreatePool { id, fd, size } => {
-                if let Ok(pool) = ShmPool::new(fd, size) {
-                    init.init(id, Arc::new(RwLock::new(pool)));
-                }
-            }
-            _ => unreachable!("wl_shm protocol request is covered"),
+        // Any other opcode is outside the version we advertise; ignoring it
+        // keeps other clients alive instead of aborting the compositor.
+        if let wl_shm::Request::CreatePool { id, fd, size } = request
+            && let Ok(pool) = ShmPool::new(fd, size)
+        {
+            init.init(id, Arc::new(RwLock::new(pool)));
         }
     }
 }
@@ -444,7 +446,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, Arc<RwLock<ShmPool>>> for WaylandState {
                     let _ = mapping.resize(size);
                 }
             }
-            _ => unreachable!("wl_shm_pool protocol request is covered"),
+            _ => {} // An opcode outside the version we advertise is a client bug;
+                    // ignoring it keeps other clients alive.
         }
     }
 }
@@ -459,10 +462,9 @@ impl Dispatch<wl_buffer::WlBuffer, BufferData> for WaylandState {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wl_buffer::Request::Destroy => {}
-            _ => unreachable!("wl_buffer protocol request is covered"),
-        }
+        // `wl_buffer` only defines `destroy` at version 1; nothing to release
+        // here because the imported mapping is dropped with the buffer data.
+        let _ = request;
     }
 }
 
@@ -520,7 +522,8 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
             | wl_surface::Request::SetBufferTransform { .. }
             | wl_surface::Request::SetBufferScale { .. }
             | wl_surface::Request::Offset { .. } => {}
-            _ => unreachable!("wl_surface protocol request is covered"),
+            _ => {} // An opcode outside the version we advertise is a client bug;
+                    // ignoring it keeps other clients alive.
         }
     }
 }
@@ -759,7 +762,8 @@ impl Dispatch<xdg_wm_base::XdgWmBase, ()> for WaylandState {
             xdg_wm_base::Request::Destroy => {
                 let _ = base;
             }
-            _ => unreachable!("xdg_wm_base protocol request is covered"),
+            _ => {} // An opcode outside the version we advertise is a client bug;
+                    // ignoring it keeps other clients alive.
         }
     }
 }
@@ -789,7 +793,8 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
             xdg_surface::Request::Destroy => {
                 let _ = surface;
             }
-            _ => unreachable!("xdg_surface protocol request is covered"),
+            _ => {} // An opcode outside the version we advertise is a client bug;
+                    // ignoring it keeps other clients alive.
         }
     }
 }
@@ -951,6 +956,11 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandState {
             zwp_linux_dmabuf_v1::Request::CreateParams { params_id } => {
                 init.init(params_id, Arc::new(Mutex::new(DmabufParams::default())));
             }
+            zwp_linux_dmabuf_v1::Request::GetDefaultFeedback { id }
+            | zwp_linux_dmabuf_v1::Request::GetSurfaceFeedback { id, .. } => {
+                let feedback = init.init(id, ());
+                send_feedback(&feedback);
+            }
             zwp_linux_dmabuf_v1::Request::Destroy => {}
             _ => {}
         }
@@ -1048,6 +1058,88 @@ fn record_and_build(
     params.height = height;
     params.format = format;
     params.build()
+}
+
+/// Formats the compositor accepts, in the order advertised to clients.
+const FEEDBACK_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+
+impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1,
+        request: zwp_linux_dmabuf_feedback_v1::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // `destroy` is the only request; nothing to clean up beyond the object.
+        let _ = request;
+    }
+}
+
+/// Sends the full `zwp_linux_dmabuf_feedback_v1` sequence.
+///
+/// Clients allocate nothing until `done` arrives: they wait for a format table
+/// and at least one tranche describing which device and formats are usable.
+/// Omitting any of these leaves the client blocked on `wl_display.sync`, which
+/// is what happens when the feedback object exists but stays silent.
+fn send_feedback(feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1) {
+    // The format table is a sealed memfd holding u32 fourcc values, as the
+    // protocol requires; clients map it read-only.
+    let table: Vec<u8> = FEEDBACK_FORMATS
+        .iter()
+        .flat_map(|fourcc| fourcc.to_le_bytes())
+        .collect();
+    let Some(table_fd) = anonymous_memfd(&table) else {
+        // Without a table the feedback is unusable; report completion so the
+        // client stops waiting and falls back to wl_shm.
+        feedback.done();
+        return;
+    };
+    let size = u32::try_from(table.len()).unwrap_or(0);
+    feedback.format_table(table_fd.as_fd(), size);
+
+    // A device identifier of zeros is valid and means "the compositor's own
+    // device"; clients only use it to group memory domains.
+    let device = [0u8; 8];
+    feedback.main_device(device.to_vec());
+    feedback.tranche_target_device(device.to_vec());
+
+    // Every format index in the table, as u16 values.
+    let indices: Vec<u8> = (0..FEEDBACK_FORMATS.len() as u16)
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    feedback.tranche_formats(indices);
+    feedback.tranche_flags(zwp_linux_dmabuf_feedback_v1::TrancheFlags::empty());
+    feedback.tranche_done();
+    feedback.done();
+}
+
+/// Creates a sealed memfd holding `contents`.
+///
+/// Falls back to `None` when memfd is unavailable so callers can degrade to
+/// `wl_shm` instead of offering feedback they cannot back.
+fn anonymous_memfd(contents: &[u8]) -> Option<OwnedFd> {
+    let name = c"waysl-dmabuf-formats";
+    // MFD_CLOEXEC | MFD_ALLOW_SEALING
+    unsafe extern "C" {
+        fn memfd_create(name: *const std::os::raw::c_char, flags: u32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    let raw = unsafe { memfd_create(name.as_ptr(), 0x0001 | 0x0002) };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh fd owned by this function.
+    // SAFETY: `raw` is a fresh fd; ownership moves into the File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw) };
+    file.write_all(contents).ok()?;
+    let fd = OwnedFd::from(file);
+    // Sealing prevents a client from mutating the table we advertised.
+    // F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL
+    let _ = unsafe { fcntl(fd.as_raw_fd(), 1031, 0x0001 | 0x0002 | 0x0004 | 0x0008) };
+    Some(fd)
 }
 
 #[cfg(test)]
