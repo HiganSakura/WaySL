@@ -454,15 +454,29 @@ Verified in this repository:
 - **Frame bridge** — unit tests cover the header layout, a full
   forwarder→renderer round trip (640×360, 921,600 bytes), bad magic, and
   zero-sized frames.
-- **Unit tests** — 35 tests, including dmabuf stride/alpha handling, format
-  opacity, short-mapping rejection, and buffer-format mapping.
-- **Protocol trace (WSL2, PhotoCraft)** — the compositor serves the six base
-  globals; PhotoCraft binds dmabuf, receives the full
-  `zwp_linux_dmabuf_feedback_v1` sequence (`format_table`, `main_device`,
-  `tranche_*`, `done`) and destroys the object cleanly.
+- **Unit tests** — 49 tests, including dmabuf stride/alpha handling, YUV
+  conversion reference values, multi-plane short/missing-plane rejection,
+  viewport crop and scaling, and buffer-format mapping.
+- **Protocol trace (WSL2, PhotoCraft)** — the compositor serves nine globals.
+  PhotoCraft binds dmabuf and the trace shows every advertised format reaching
+  the client:
+
+  ```text
+  zwp_linux_dmabuf_v1#28.modifier(875713112, 0, 0)   XR24  (XRGB8888)
+  zwp_linux_dmabuf_v1#28.modifier(875713089, 0, 0)   AR24  (ARGB8888)
+  zwp_linux_dmabuf_v1#28.modifier(842094158, 0, 0)   NV12
+  zwp_linux_dmabuf_v1#28.modifier(1448695129, 0, 0)  YUYV
+  zwp_linux_dmabuf_v1#28.modifier(1498831189, 0, 0)  UYVY
+  ```
+
+  The feedback object follows the same path: `format_table(fd, 20)` (five
+  fourcc entries), `main_device`, `tranche_target_device`,
+  `tranche_formats` (ten bytes, five `u16` indices), `tranche_flags`,
+  `tranche_done`, `done`, then the client destroys it cleanly.
 - **GPU probe (WSL2 on a Quadro P4000 host)** — the compositor logs
-  `dmabuf export available via Mesa Project (EGL 1.5)` and advertises seven
-  globals including `zwp_linux_dmabuf_v1`. The Windows renderer picks
+  `dmabuf export available via Mesa Project (EGL 1.5)` and advertises nine
+  globals including `zwp_linux_dmabuf_v1`, `wl_subcompositor` and
+  `wp_viewporter`. The Windows renderer picks
   `AdapterInfo { name: "Quadro P4000", device_type: DiscreteGpu, backend:
   Vulkan }`.
 - **Window on the Windows desktop** — `photocraft-wsl.png` shows PhotoCraft's
