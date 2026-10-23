@@ -487,16 +487,25 @@ Known gaps:
   shows the full UI. Without it the client still fails, because the `vgem` stub
   at `/dev/dri/card0` defeats Mesa's automatic driver detection. Making that
   selection automatic would need a change in Mesa, not in WaySL.
-  No `create_immed` dmabuf import is issued even on the working path, so
-  PhotoCraft delivers pixels through `wl_shm` rather than dma-buf.
+  Two EGL devices are enumerated on WSL2: one DRM-capable, one tagged
+  `EGL_MESA_device_software`. Both report `D3D12 (NVIDIA Quadro P4000)`, and the
+  software-labelled one only issues `wl_shm` capability queries, so the label
+  does not mean CPU rendering.
+- No client on this host imports a dma-buf: Mesa binds
+  `zwp_linux_dmabuf_v1`, consumes the feedback and then never calls
+  `create_params` or `create_immed`, allocating through `wl_shm` instead. The
+  device wgpu binds is the `wl_shm`-only, software-labelled one. Reaching the
+  dma-buf path would need wgpu to select the DRM-capable device, which is
+  outside the compositor.
 - The renderer paints with a plain `Camera2d` and sprite. Custom projections,
   render layers, and non-zero transforms did not paint on the software D3D12
   adapter used in early testing, so that configuration is kept deliberately
   minimal.
 - Desktop capture requires an active interactive session; a disconnected RDP
   session captures as a single flat colour and must not be read as evidence.
-- Only single-plane 32-bit dmabuf formats are rasterised; multi-plane (YUV)
-  formats answer `failed()`.
+- dma-buf import covers XRGB8888/ARGB8888, NV12 and YUYV/UYVY. YUV is converted
+  with BT.601 limited range and nearest-neighbour scaling; a colour-management
+  protocol would be needed for other matrices.
 - Pixel transport over the Windows TCP Wayland endpoint.
 - Protocols beyond the table above (`wp_viewporter`, fractional scaling,
   explicit sync, …).
