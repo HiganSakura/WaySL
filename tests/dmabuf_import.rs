@@ -162,6 +162,20 @@ mod unix {
                             return events;
                         }
                     }
+                    // A timeout means the compositor sent nothing more before
+                    // the callback; report what arrived instead of hanging.
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        panic!(
+                            "roundtrip timed out after {} events: {events:?}",
+                            events.len()
+                        )
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                        panic!(
+                            "roundtrip timed out after {} events: {events:?}",
+                            events.len()
+                        )
+                    }
                     Err(error) => panic!("roundtrip failed: {error}"),
                 }
             }
@@ -246,8 +260,12 @@ mod unix {
 
         // One plane: fd, plane index, offset, stride, modifier hi/lo.
         let owned = memfd((STRIDE * HEIGHT) as usize, 0x40);
+        // `add(fd, plane_idx, offset, stride, modifier_hi, modifier_lo)`: the
+        // descriptor travels in the ancillary data, so the payload starts at
+        // plane_idx.
         let mut add = Vec::new();
-        add.extend_from_slice(&2u32.to_le_bytes()); // plane 0 offset
+        add.extend_from_slice(&0u32.to_le_bytes()); // plane_idx
+        add.extend_from_slice(&0u32.to_le_bytes()); // offset
         add.extend_from_slice(&STRIDE.to_le_bytes());
         add.extend_from_slice(&0u32.to_le_bytes()); // modifier_hi
         add.extend_from_slice(&0u32.to_le_bytes()); // modifier_lo
@@ -262,7 +280,9 @@ mod unix {
         immed.extend_from_slice(&0u32.to_le_bytes()); // flags
         client.send(params_id, DMABUF_CREATE_IMMED, &immed);
 
-        // The compositor answers `failed` on params when the import is refused.
+        // Every message above is queued on the stream; the sync that follows is
+        // what makes the server process them, so the callback id is allocated
+        // last and the read may legitimately see `params.failed` first.
         let events = client.roundtrip();
         let failed = events
             .iter()
