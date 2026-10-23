@@ -225,52 +225,165 @@ impl BufferFormat {
 const DRM_FORMAT_XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 /// DRM fourcc for 32-bit ARGB.
 const DRM_FORMAT_ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
+/// DRM fourcc for packed YUV 4:2:2 (Y first).
+const DRM_FORMAT_YUYV: u32 = u32::from_le_bytes(*b"YUYV");
+/// DRM fourcc for packed YUV 4:2:2 (U first).
+const DRM_FORMAT_UYVY: u32 = u32::from_le_bytes(*b"UYVY");
+/// DRM fourcc for semi-planar YUV 4:2:0 (luma plane + interleaved chroma).
+const DRM_FORMAT_NV12: u32 = u32::from_le_bytes(*b"NV12");
 
 /// One imported dma-buf plane set, kept alive for the lifetime of its buffer.
 struct DmabufImage {
     width: i32,
     height: i32,
+    /// Row stride of plane 0, reported alongside the buffer.
     stride: i32,
     fourcc: u32,
-    mapping: Vec<u8>,
+    /// One mapping per plane, in plane order. Single-plane formats have one.
+    planes: Vec<Vec<u8>>,
 }
 
 impl DmabufImage {
-    /// Reads the plane back into tightly packed RGBA8.
+    /// Reads the planes back into tightly packed RGBA8.
     ///
     /// dma-buf contents are only reachable through a mapping; `mmap` is
-    /// attempted here and, when it fails, the import is rejected so clients
-    /// can fall back to `wl_shm` instead of receiving a corrupt frame.
+    /// attempted when the buffer is imported and, when it fails, the import is
+    /// rejected so clients can fall back to `wl_shm` instead of receiving a
+    /// corrupt frame.
     fn to_rgba(&self) -> Option<Vec<u8>> {
+        match self.fourcc {
+            DRM_FORMAT_YUYV | DRM_FORMAT_UYVY => self.yuv_packed_to_rgba(),
+            DRM_FORMAT_NV12 => self.nv12_to_rgba(),
+            _ => self.rgb_to_rgba(),
+        }
+    }
+
+    /// 32-bit RGB formats: one plane, four bytes per pixel.
+    fn rgb_to_rgba(&self) -> Option<Vec<u8>> {
         let width = usize::try_from(self.width).ok()?;
         let height = usize::try_from(self.height).ok()?;
         let stride = usize::try_from(self.stride).ok()?;
-        let needle = stride.checked_mul(height)?;
-        if self.mapping.len() < needle {
+        let plane = self.planes.first()?;
+        if plane.len() < stride.checked_mul(height)? {
             return None;
         }
         let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
-        let opaque = matches!(self.fourcc, 0 | DRM_FORMAT_XRGB8888);
+        let opaque = self.fourcc == DRM_FORMAT_XRGB8888;
         for y in 0..height {
             for x in 0..width {
                 let source = y * stride + x * 4;
                 let target = (y * width + x) * 4;
-                if source + 4 > self.mapping.len() {
+                if source + 4 > plane.len() {
                     return None;
                 }
-                let b = self.mapping[source];
-                let g = self.mapping[source + 1];
-                let r = self.mapping[source + 2];
+                let b = plane[source];
+                let g = plane[source + 1];
+                let r = plane[source + 2];
                 pixels[target..target + 3].copy_from_slice(&[r, g, b]);
-                pixels[target + 3] = if opaque {
-                    0xff
-                } else {
-                    self.mapping[source + 3]
-                };
+                pixels[target + 3] = if opaque { 0xff } else { plane[source + 3] };
             }
         }
         Some(pixels)
     }
+
+    /// NV12: plane 0 is 8-bit luma, plane 1 is half-height interleaved chroma.
+    fn nv12_to_rgba(&self) -> Option<Vec<u8>> {
+        let width = usize::try_from(self.width).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        let luma_stride = usize::try_from(self.stride).ok()?;
+        let chroma_stride = luma_stride;
+        let luma = self.planes.first()?;
+        let chroma = self.planes.get(1)?;
+        if luma.len() < luma_stride.checked_mul(height)? {
+            return None;
+        }
+        let chroma_rows = height.div_ceil(2);
+        if chroma.len() < chroma_stride.checked_mul(chroma_rows)? {
+            return None;
+        }
+        let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
+        for y in 0..height {
+            for x in 0..width {
+                let luma_index = y * luma_stride + x;
+                if luma_index >= luma.len() {
+                    return None;
+                }
+                // 4:2:0: one chroma pair covers a 2x2 block.
+                let chroma_index = (y / 2) * chroma_stride + (x / 2) * 2;
+                if chroma_index + 1 >= chroma.len() {
+                    return None;
+                }
+                let (r, g, b) = yuv_to_rgb(
+                    luma[luma_index],
+                    chroma[chroma_index],
+                    chroma[chroma_index + 1],
+                );
+                let target = (y * width + x) * 4;
+                pixels[target..target + 3].copy_from_slice(&[r, g, b]);
+                pixels[target + 3] = 0xff;
+            }
+        }
+        Some(pixels)
+    }
+
+    /// YUYV/UYVY: one plane with two pixels per four-byte group.
+    fn yuv_packed_to_rgba(&self) -> Option<Vec<u8>> {
+        let width = usize::try_from(self.width).ok()?;
+        let height = usize::try_from(self.height).ok()?;
+        let stride = usize::try_from(self.stride).ok()?;
+        let plane = self.planes.first()?;
+        if plane.len() < stride.checked_mul(height)? {
+            return None;
+        }
+        let uyvy = self.fourcc == DRM_FORMAT_UYVY;
+        let mut pixels = vec![0; width.checked_mul(height)?.checked_mul(4)?];
+        for y in 0..height {
+            for x in 0..width {
+                // Both layouts repeat every chroma sample across two pixels.
+                let group = y * stride + (x / 2) * 4;
+                if group + 4 > plane.len() {
+                    return None;
+                }
+                let (y0, u, y1, v) = if uyvy {
+                    (
+                        plane[group + 1],
+                        plane[group],
+                        plane[group + 3],
+                        plane[group + 2],
+                    )
+                } else {
+                    (
+                        plane[group],
+                        plane[group + 1],
+                        plane[group + 2],
+                        plane[group + 3],
+                    )
+                };
+                let luma = if x % 2 == 0 { y0 } else { y1 };
+                let (r, g, b) = yuv_to_rgb(luma, u, v);
+                let target = (y * width + x) * 4;
+                pixels[target..target + 3].copy_from_slice(&[r, g, b]);
+                pixels[target + 3] = 0xff;
+            }
+        }
+        Some(pixels)
+    }
+}
+
+/// Converts one BT.601 full-range YUV sample triple to RGB.
+///
+/// This is the conversion every software YUV path uses; the colour space is
+/// assumed to be BT.601 limited range, which is what dmabuf clients send unless
+/// they negotiate a colour-management protocol WaySL does not implement.
+fn yuv_to_rgb(y: u8, u: u8, v: u8) -> (u8, u8, u8) {
+    let y = f32::from(y);
+    let u = f32::from(u) - 128.0;
+    let v = f32::from(v) - 128.0;
+    let r = 1.164 * (y - 16.0) + 1.596 * v;
+    let g = 1.164 * (y - 16.0) - 0.392 * u - 0.813 * v;
+    let b = 1.164 * (y - 16.0) + 2.017 * u;
+    let clamp = |value: f32| value.clamp(0.0, 255.0) as u8;
+    (clamp(r), clamp(g), clamp(b))
 }
 
 /// Pending `zwp_linux_buffer_params_v1`, populated plane by plane.
@@ -295,24 +408,63 @@ impl DmabufParams {
     /// Only single-plane 32-bit formats are rasterised; anything else is
     /// rejected so the client can pick a supported alternative.
     fn build(&self) -> Option<DmabufImage> {
-        let plane = self.planes.first()?;
-        let stride = i32::try_from(plane.stride).ok()?;
+        let first = self.planes.first()?;
+        let stride = i32::try_from(first.stride).ok()?;
         let height = usize::try_from(self.height).ok()?;
-        let stride_usize = usize::try_from(plane.stride).ok()?;
-        let offset = usize::try_from(plane.offset).ok()?;
-        let len = stride_usize.checked_mul(height)?.checked_add(offset)?;
-        let mapping = unsafe {
-            let ptr = mmap_read_write(plane.fd.as_raw_fd(), len).ok()?;
-            let slice = std::slice::from_raw_parts(ptr, len);
-            slice[offset..].to_vec()
-        };
+        let required_planes = plane_count(self.format)?;
+        if self.planes.len() < required_planes {
+            return None;
+        }
+
+        // Chroma planes are subsampled, so each plane's mapping length is
+        // derived from its own stride and the format's vertical subsampling.
+        let mut mappings = Vec::with_capacity(required_planes);
+        for (index, plane) in self.planes.iter().take(required_planes).enumerate() {
+            let plane_stride = usize::try_from(plane.stride).ok()?;
+            let rows = if index == 0 {
+                height
+            } else {
+                height.div_ceil(vertical_subsampling(self.format)?)
+            };
+            let offset = usize::try_from(plane.offset).ok()?;
+            let len = plane_stride.checked_mul(rows)?.checked_add(offset)?;
+            // SAFETY: `mmap_read_write` maps the plane's fd; the slice is
+            // copied immediately, so it cannot outlive the mapping.
+            let mapping = unsafe {
+                let ptr = mmap_read_write(plane.fd.as_raw_fd(), len).ok()?;
+                let slice = std::slice::from_raw_parts(ptr, len);
+                slice[offset..].to_vec()
+            };
+            if mapping.len() < plane_stride.checked_mul(rows)? {
+                return None;
+            }
+            mappings.push(mapping);
+        }
         Some(DmabufImage {
             width: self.width,
             height: self.height,
             stride,
             fourcc: self.format,
-            mapping,
+            planes: mappings,
         })
+    }
+}
+
+/// Number of dma-buf planes a format requires.
+fn plane_count(fourcc: u32) -> Option<usize> {
+    match fourcc {
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_YUYV | DRM_FORMAT_UYVY => Some(1),
+        DRM_FORMAT_NV12 => Some(2),
+        _ => None,
+    }
+}
+
+/// Vertical chroma subsampling factor for a format.
+fn vertical_subsampling(fourcc: u32) -> Option<usize> {
+    match fourcc {
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_YUYV | DRM_FORMAT_UYVY => Some(1),
+        DRM_FORMAT_NV12 => Some(2),
+        _ => None,
     }
 }
 
@@ -979,8 +1131,9 @@ impl GlobalDispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for WaylandState 
         init: &mut DataInit<'_, Self>,
     ) {
         let dmabuf = init.init(resource, ());
-        // Advertise the single-plane 32-bit layouts this compositor can read.
-        for fourcc in [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888] {
+        // Advertise every layout `DmabufImage::to_rgba` can rasterise, so the
+        // deprecated per-format list and the feedback format table agree.
+        for fourcc in FEEDBACK_FORMATS {
             dmabuf.modifier(fourcc, 0, 0);
         }
     }
@@ -1181,7 +1334,13 @@ fn record_and_build(
 }
 
 /// Formats the compositor accepts, in the order advertised to clients.
-const FEEDBACK_FORMATS: [u32; 2] = [DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888];
+const FEEDBACK_FORMATS: [u32; 5] = [
+    DRM_FORMAT_XRGB8888,
+    DRM_FORMAT_ARGB8888,
+    DRM_FORMAT_NV12,
+    DRM_FORMAT_YUYV,
+    DRM_FORMAT_UYVY,
+];
 
 impl Dispatch<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1, ()> for WaylandState {
     fn request(
@@ -1442,7 +1601,7 @@ mod tests {
             height,
             stride,
             fourcc,
-            mapping,
+            planes: vec![mapping],
         }
     }
 
@@ -1480,7 +1639,7 @@ mod tests {
             height: 4,
             stride: 16,
             fourcc: DRM_FORMAT_XRGB8888,
-            mapping: vec![0; 8],
+            planes: vec![vec![0; 8]],
         };
         assert!(image.to_rgba().is_none());
     }
@@ -1580,6 +1739,120 @@ mod tests {
         let (w, h, out) = apply_viewport(&pixels, 4, 2, Some(source), None);
         assert_eq!((w, h), (1, 1));
         assert_eq!(out[0], 3);
+    }
+
+    #[test]
+    fn yuv_to_rgb_handles_reference_values() {
+        // Limited-range black and white are the two values a wrong matrix gets
+        // wrong most visibly.
+        assert_eq!(yuv_to_rgb(16, 128, 128), (0, 0, 0));
+        // 1.164 * (235 - 16) = 254.9, which truncates to 254; allow one step.
+        let white = yuv_to_rgb(235, 128, 128);
+        assert!(
+            white.0 >= 254 && white.1 >= 254 && white.2 >= 254,
+            "got {white:?}"
+        );
+        // Pure red in BT.601 limited range.
+        let (r, g, b) = yuv_to_rgb(81, 90, 240);
+        assert!(r > 200 && g < 70 && b < 70, "got {r},{g},{b}");
+    }
+
+    #[test]
+    fn nv12_luma_only_plane_gives_grey() {
+        // 2x2 all mid-grey luma with neutral chroma.
+        let image = DmabufImage {
+            width: 2,
+            height: 2,
+            stride: 2,
+            fourcc: DRM_FORMAT_NV12,
+            planes: vec![vec![128, 128, 128, 128], vec![128, 128]],
+        };
+        let pixels = image.to_rgba().expect("convert");
+        assert_eq!(pixels.len(), 2 * 2 * 4);
+        // Neutral chroma produces equal channels.
+        assert_eq!(pixels[0], pixels[1]);
+        assert_eq!(pixels[1], pixels[2]);
+        assert_eq!(pixels[3], 0xff);
+    }
+
+    #[test]
+    fn nv12_rejects_missing_chroma_plane() {
+        let image = DmabufImage {
+            width: 2,
+            height: 2,
+            stride: 2,
+            fourcc: DRM_FORMAT_NV12,
+            planes: vec![vec![128, 128, 128, 128]],
+        };
+        assert!(image.to_rgba().is_none());
+    }
+
+    #[test]
+    fn nv12_rejects_short_chroma_plane() {
+        let image = DmabufImage {
+            width: 2,
+            height: 2,
+            stride: 2,
+            fourcc: DRM_FORMAT_NV12,
+            planes: vec![vec![128, 128, 128, 128], vec![128]],
+        };
+        assert!(image.to_rgba().is_none());
+    }
+
+    #[test]
+    fn nv12_rejects_short_luma_plane() {
+        let image = DmabufImage {
+            width: 32,
+            height: 32,
+            stride: 32,
+            fourcc: DRM_FORMAT_NV12,
+            planes: vec![vec![128; 32], vec![128; 32 * 16]],
+        };
+        assert!(image.to_rgba().is_none());
+    }
+
+    #[test]
+    fn yuyv_groups_two_pixels_per_chroma() {
+        // One 2x1 row: Y0 U Y1 V.
+        let image = DmabufImage {
+            width: 2,
+            height: 1,
+            stride: 4,
+            fourcc: DRM_FORMAT_YUYV,
+            planes: vec![vec![128, 128, 128, 128]],
+        };
+        let pixels = image.to_rgba().expect("convert");
+        assert_eq!(pixels.len(), 2 * 4);
+        // Both pixels share chroma, so they match.
+        assert_eq!(&pixels[0..3], &pixels[4..7]);
+        // And the result is grey-ish for neutral chroma.
+        assert_eq!(pixels[0], pixels[1]);
+        assert_eq!(pixels[1], pixels[2]);
+    }
+
+    #[test]
+    fn uyvy_orders_chroma_first() {
+        let image = DmabufImage {
+            width: 2,
+            height: 1,
+            stride: 4,
+            fourcc: DRM_FORMAT_UYVY,
+            planes: vec![vec![128, 128, 128, 128]],
+        };
+        let pixels = image.to_rgba().expect("convert");
+        // Neutral chroma in either layout must give the same grey.
+        assert_eq!(pixels[0], pixels[1]);
+        assert_eq!(pixels[1], pixels[2]);
+    }
+
+    #[test]
+    fn plane_count_matches_formats() {
+        assert_eq!(plane_count(DRM_FORMAT_ARGB8888), Some(1));
+        assert_eq!(plane_count(DRM_FORMAT_YUYV), Some(1));
+        assert_eq!(plane_count(DRM_FORMAT_NV12), Some(2));
+        assert_eq!(plane_count(u32::from_le_bytes(*b"YU12")), None);
+        assert_eq!(vertical_subsampling(DRM_FORMAT_NV12), Some(2));
+        assert_eq!(vertical_subsampling(DRM_FORMAT_ARGB8888), Some(1));
     }
 
     #[test]
