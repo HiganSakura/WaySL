@@ -174,6 +174,42 @@ Three details matter in `src/egl.rs`:
 `libEGL` is opened with `dlopen`, so the crate builds and runs on hosts without
 EGL; the probe simply reports `NoEgl`.
 
+### Making clients use the GPU
+
+The probe only decides whether **WaySL** advertises dmabuf. A client that draws
+through Mesa's GL stack picks its own driver, and on WSL2 it picks the wrong
+one: `/dev/dri/card0` is `vgem` (a dummy GEM device, `DRIVER=faux_driver`), so
+`dri2` reports `failed to get driver name for fd -1` and
+`eglInitialize` fails with `0x3003` (`EGL_BAD_ALLOC`). The client then falls
+back to llvmpipe, or aborts with
+`WGPU error: Failed to create surface for any enabled backend`.
+
+`MESA_LOADER_DRIVER_OVERRIDE` does **not** help (it still lands on llvmpipe);
+only `GALLIUM_DRIVER=d3d12` selects the driver that runs on `/dev/dxg`. Set it
+system-wide so every process inherits it:
+
+```sh
+cat > /etc/profile.d/waysl-gpu.sh <<'EOF'
+export GALLIUM_DRIVER=d3d12
+export MESA_LOADER_DRIVER_OVERRIDE=d3d12
+EOF
+
+mkdir -p /etc/systemd/system.conf.d
+printf '[Manager]\nDefaultEnvironment=GALLIUM_DRIVER=d3d12\n' \
+  > /etc/systemd/system.conf.d/waysl-gpu.conf
+
+printf 'GALLIUM_DRIVER=d3d12\n' >> /etc/environment
+```
+
+The three files cover login shells, systemd units, and `wsl -- cmd`
+respectively. Verify with `eglinfo -B | grep D3D12`, which should report
+`D3D12 (NVIDIA Quadro P4000)` rather than `llvmpipe`.
+
+Applications also cache their own GPU decision: PhotoCraft writes
+`~/.config/photocraft/gpu-starting.json`, and after a failed start it records
+`"backend":"cpu"` and stops retrying. Delete that file after fixing the driver
+selection, or it keeps falling back even when the GPU now works.
+
 ## Renderer behaviour
 
 - One Windows window per Wayland surface, created on first frame.
@@ -263,17 +299,22 @@ Screenshot evidence:
 | Image | What it shows |
 |---|---|
 | `photocraft-wsl.png` | PhotoCraft maximized with an open 1920×1080 document; `WaySL surface` in the taskbar |
-| `photocraft-gpu.png` | PhotoCraft's start screen through WaySL on the GPU-backed renderer |
+| `photocraft-gpu.png` | PhotoCraft's start screen through WaySL |
+| `photocraft-gpu-final.png` | PhotoCraft running GPU-accelerated (D3D12 via `/dev/dxg`) after the `GALLIUM_DRIVER` fix |
 | `waysl-headless-e2e.png` | Headless compositor → frame bridge → `WaySL shm smoke` window |
 | `waysl-screen.png` | `WaySL surface` and `WaySL-Via-Waypipe` windows side by side |
 | `waysl-windows-client.png` | The `WaySL-Windows` window showing the smoke client's gradient |
 
 Known gaps:
 
-- PhotoCraft still does not reach a GPU swapchain of its own: its log ends with
-  `WGPU error: Failed to create surface for any enabled backend` and no
-  `create_immed` import is ever issued. The compositor side is healthy; the
-  client-side adapter selection is not solved.
+- PhotoCraft runs GPU-accelerated once `GALLIUM_DRIVER=d3d12` is set (see
+  "Making clients use the GPU"): with it, `eglInitialize` succeeds, the GPU
+  canvas initialises, 16 frames cross the bridge and `photocraft-gpu-final.png`
+  shows the full UI. Without it the client still fails, because the `vgem` stub
+  at `/dev/dri/card0` defeats Mesa's automatic driver detection. Making that
+  selection automatic would need a change in Mesa, not in WaySL.
+  No `create_immed` dmabuf import is issued even on the working path, so
+  PhotoCraft delivers pixels through `wl_shm` rather than dma-buf.
 - The renderer paints with a plain `Camera2d` and sprite. Custom projections,
   render layers, and non-zero transforms did not paint on the software D3D12
   adapter used in early testing, so that configuration is kept deliberately
