@@ -6,7 +6,9 @@
 #![cfg(unix)]
 
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +16,7 @@ use std::sync::{Arc, Mutex, RwLock, mpsc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "linux")]
 use std::io::Write as _;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
@@ -1399,6 +1402,7 @@ fn send_feedback(feedback: &zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedback
 ///
 /// Falls back to `None` when memfd is unavailable so callers can degrade to
 /// `wl_shm` instead of offering feedback they cannot back.
+#[cfg(target_os = "linux")]
 fn anonymous_memfd(contents: &[u8]) -> Option<OwnedFd> {
     let name = c"waysl-dmabuf-formats";
     // MFD_CLOEXEC | MFD_ALLOW_SEALING
@@ -1419,6 +1423,13 @@ fn anonymous_memfd(contents: &[u8]) -> Option<OwnedFd> {
     // F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL
     let _ = unsafe { fcntl(fd.as_raw_fd(), 1031, 0x0001 | 0x0002 | 0x0004 | 0x0008) };
     Some(fd)
+}
+
+/// `memfd_create` is Linux-specific, so other Unix hosts cannot provide a
+/// format table; the feedback object reports `done` without one instead.
+#[cfg(not(target_os = "linux"))]
+fn anonymous_memfd(_contents: &[u8]) -> Option<OwnedFd> {
+    None
 }
 
 // ---------------------------------------------------------------------------
