@@ -210,6 +210,166 @@ Applications also cache their own GPU decision: PhotoCraft writes
 `"backend":"cpu"` and stops retrying. Delete that file after fixing the driver
 selection, or it keeps falling back even when the GPU now works.
 
+## Running PhotoCraft end to end
+
+PhotoCraft (`winit` + `wgpu` + `egui`) is the reference application: it is a
+real toolkit stack rather than a synthetic client, and every protocol gap WaySL
+had was found by running it. This is the full sequence, in order.
+
+### 1. Host prerequisites (Windows)
+
+The renderer must run inside an **interactive desktop session**. A scheduled
+task with `-LogonType Interactive` is the reliable way to get there; a task that
+runs in session 0 (services) has no desktop and creates no visible window.
+
+If the machine enforces Smart App Control, a freshly built unsigned
+`waysl.exe` is blocked (`was blocked by your organization's Device Guard
+policy`). Sign it with a locally trusted certificate instead of disabling SAC:
+
+```powershell
+$cert = New-SelfSignedCertificate -Type CodeSigningCert `
+  -Subject "CN=WaySL Local Dev" -CertStoreLocation Cert:\CurrentUser\My `
+  -KeyUsage DigitalSignature -KeyExportPolicy Exportable
+Export-Certificate -Cert $cert -FilePath C:\waysl.cer | Out-Null
+certutil -addstore -f Root C:\waysl.cer
+certutil -addstore -f TrustedPublisher C:\waysl.cer
+Set-AuthenticodeSignature -FilePath C:\path\to\waysl.exe -Certificate $cert
+```
+
+`Get-AuthenticodeSignature` should then report `Status: Valid`.
+
+### 2. Reach the renderer from WSL2
+
+WSL2 is NAT'd, so a renderer listening on `127.0.0.1` is not reachable from the
+distro. Forward it through the gateway address:
+
+```powershell
+$gw = (Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.InterfaceAlias -like "*WSL*" }).IPAddress
+netsh interface portproxy add v4tov4 listenaddress=$gw listenport=48765 `
+  connectaddress=127.0.0.1 connectport=48765
+netsh advfirewall firewall add rule name="WaySL Bridge" dir=in `
+  action=allow protocol=TCP localport=48765
+```
+
+Verify from inside WSL with `timeout 3 bash -c "echo > /dev/tcp/$GW/48765"`.
+
+### 3. GPU driver selection (Linux)
+
+See "Making clients use the GPU" above. Confirm with:
+
+```sh
+eglinfo -B 2>/dev/null | grep -c D3D12    # expect a non-zero count
+```
+
+### 4. Start the compositor
+
+```sh
+XDG_RUNTIME_DIR=/tmp \
+WAYSL_WAYLAND_SOCKET=/tmp/waysl-wayland-0 \
+WAYSL_FRAME_FORWARD=<wsl-gateway>:48765 \
+  ./target/release/waysl
+```
+
+It logs the GPU decision before accepting clients:
+
+```text
+WaySL GPU path: dmabuf export available via Mesa Project (EGL 1.5)
+```
+
+When the probe fails it logs the reason instead (`no EGL display: eglInitialize
+failed (EGL error 0x3003)`) and simply does not advertise `zwp_linux_dmabuf_v1`.
+
+### 5. Launch PhotoCraft
+
+```sh
+XDG_RUNTIME_DIR=/tmp WAYLAND_DISPLAY=/tmp/waysl-wayland-0 \
+  ./photocraft.AppImage
+```
+
+PhotoCraft needs `libfuse2` for the AppImage and a working X11 clipboard is not
+required (it logs a harmless `arboard` fallback warning under Wayland).
+
+### What a healthy run looks like
+
+Compositor side:
+
+```text
+WaySL GPU path: dmabuf export available via Mesa Project (EGL 1.5)
+```
+
+PhotoCraft side — the important lines are the `GPU startup` plan and the
+absence of `eglInitialize` errors:
+
+```text
+INFO photocraft: GPU startup: Plan { backend: Gl, env: None, reason: None }
+INFO photocraft_ui_egui::gpu_canvas: gpu canvas: target Rgba8Unorm, max texture 16384
+```
+
+Renderer side:
+
+```text
+INFO bevy_render::renderer: AdapterInfo { name: "Quadro P4000", device_type: DiscreteGpu, backend: Vulkan }
+INFO bevy_winit::system: Creating new window PhotoCraft
+INFO waysl::renderer::surfaces: received frame
+```
+
+A protocol trace (`WAYLAND_DEBUG=1`) shows the full negotiation:
+
+```text
+wl_compositor#3.create_surface(new id wl_surface#10)
+xdg_wm_base#8.get_xdg_surface(new id xdg_surface#13, wl_surface#12)
+xdg_surface#13.get_toplevel(new id xdg_toplevel#14)
+xdg_toplevel#14.set_title("PhotoCraft")
+wl_surface#12.attach(wl_buffer#20, 0, 0)
+wl_surface#12.commit()
+```
+
+`photocraft-gpu-final.png` is the resulting window: 1440×900, full UI, on the
+Windows desktop.
+
+### Symptoms and their causes
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `eglInitialize` code `0x3003` | Mesa picked `vgem` and found no driver | Set `GALLIUM_DRIVER=d3d12` |
+| `Failed to create surface for any enabled backend` | Same, surfacing through wgpu | Same |
+| `the previous start didn't finish ... using cpu` | Stale `gpu-starting.json` | Delete the file |
+| `Connection refused` to the bridge | WSL2 NAT | Add the portproxy |
+| Renderer runs, no window appears | Task ran in session 0 | Use `-LogonType Interactive` |
+| `was blocked by ... Device Guard policy` | Smart App Control | Sign the binary |
+| `Subcompositor protocol not available` | Expected — WaySL does not offer it | Harmless; CSD falls back |
+| `arboard ... clipboard` warnings | Expected — no data-control protocol | Harmless |
+
+## Debugging notes
+
+These are the specific traps encountered while building this, recorded so they
+are not rediscovered.
+
+**`dlsym` does not find EGL extension functions.** `eglQueryDevicesEXT` and
+`eglGetPlatformDisplayEXT` return null from `dlsym` even though
+`eglQueryString(EGL_EXTENSIONS)` advertises them. They must be resolved with
+`eglGetProcAddress`. This was the difference between `EGL_NOT_INITIALIZED` and a
+working display.
+
+**Probing EGL before binding the socket deadlocks.** `eglGetDisplay` reads
+`WAYLAND_DISPLAY` and tries to connect; when WaySL *is* that compositor and has
+not bound yet, the probe blocks forever in `unix_stream_connect`. Bind first,
+then probe with those variables cleared.
+
+**`gbm_bo_create` is the wrong test for GPU availability.** It fails on WSL2
+because `/dev/dxg` is not a DRM node, but the D3D12/EGL path works fine. A
+`gbm_bo_create` failure says nothing about whether the GPU is usable.
+
+**A dead compositor looks like a client bug.** A stale socket file with no
+process behind it makes every client fail identically, and `wayland-info`
+returns nothing. Always confirm `pgrep -f waysl` and the socket owner before
+concluding a client is at fault.
+
+**Chrome-style captures can lie.** A disconnected RDP session captures as a
+single flat colour. Confirm a capture by checking that it has many distinct
+colours and plausible structure, not just that the file was written.
+
 ## Renderer behaviour
 
 - One Windows window per Wayland surface, created on first frame.
