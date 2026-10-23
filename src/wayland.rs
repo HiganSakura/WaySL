@@ -22,7 +22,7 @@ use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat,
-    wl_shm, wl_shm_pool, wl_surface,
+    wl_shm, wl_shm_pool, wl_subcompositor, wl_subsurface, wl_surface,
 };
 
 use wayland_server::{
@@ -92,6 +92,10 @@ pub fn run_with_sender(
     if gpu.is_ready() {
         handle.create_global::<WaylandState, zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()>(4, ());
     }
+    // Clients only need this to exist: bitmaps have no subsurface content, so
+    // any subsurface is driven to a no-op instead of leaving the client without
+    // server-side decorations.
+    handle.create_global::<WaylandState, wl_subcompositor::WlSubcompositor, ()>(1, ());
     let mut state = WaylandState {
         sender: Some(sender),
         next_serial: 0,
@@ -1158,6 +1162,69 @@ fn anonymous_memfd(contents: &[u8]) -> Option<OwnedFd> {
     // F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL
     let _ = unsafe { fcntl(fd.as_raw_fd(), 1031, 0x0001 | 0x0002 | 0x0004 | 0x0008) };
     Some(fd)
+}
+
+// ---------------------------------------------------------------------------
+// wl_subcompositor
+//
+// WaySL renders one RGBA bitmap per surface, so a subsurface has no separate
+// content to composite. Offering the global still matters: libwayland clients
+// (and winit's client-side-decoration path) probe for it and behave differently
+// when it is absent. Subsurfaces are therefore accepted and driven to a no-op,
+// which is preferable to leaving a client in its "no CSD" fallback.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<wl_subcompositor::WlSubcompositor, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<wl_subcompositor::WlSubcompositor>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        init.init(resource, ());
+    }
+}
+
+impl Dispatch<wl_subcompositor::WlSubcompositor, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_subcompositor::WlSubcompositor,
+        request: wl_subcompositor::Request,
+        _: &(),
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wl_subcompositor::Request::GetSubsurface { id, .. } => {
+                init.init(id, ());
+            }
+            wl_subcompositor::Request::Destroy => {}
+            other => eprintln!("[waysl] ignoring unsupported wl_subcompositor request: {other:?}"),
+        }
+    }
+}
+
+impl Dispatch<wl_subsurface::WlSubsurface, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wl_subsurface::WlSubsurface,
+        request: wl_subsurface::Request,
+        _: &(),
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        // `set_position`, `place_above`, `place_below` and the sync/desync pair
+        // describe compositing the bitmap renderer does not perform; accepting
+        // and ignoring them keeps clients on their normal code path.
+        match request {
+            wl_subsurface::Request::Destroy => {}
+            other => eprintln!("[waysl] ignoring unsupported wl_subsurface request: {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

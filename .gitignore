@@ -28,3 +28,7 @@ rustc-ice-*.txt
 
 # Python bytecode
 __pycache__/
+
+# Python bytecode from tools/*.py
+__pycache__/
+*.pyc
