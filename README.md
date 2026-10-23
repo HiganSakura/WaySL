@@ -355,6 +355,76 @@ Windows desktop.
 | `Subcompositor protocol not available` | Only on builds before `wl_subcompositor` was added | Update WaySL |
 | `arboard ... clipboard` warnings | Expected — no data-control protocol | Harmless |
 
+## Why clients never import a dma-buf
+
+WaySL advertises `zwp_linux_dmabuf_v1`, sends a correct format table and
+tranche, and PhotoCraft receives all of it. Yet `create_params` and
+`create_immed` never appear in any trace. Reading the client's source explains
+why, and the answer is not in WaySL.
+
+### PhotoCraft has no dma-buf code
+
+```sh
+grep -rn "dmabuf\|dma_buf\|gbm" --include="*.rs" crates/ apps/
+# (no matches)
+```
+
+The application never asks for zero-copy. Every `zwp_linux_dmabuf_v1` request in
+the trace originates in Mesa's EGL layer, which binds the global to query
+capabilities and then allocates through `wl_shm`.
+
+### wgpu picks the Wayland platform, which cannot export
+
+wgpu-hal 30 matches on the raw display handle before considering surfaceless
+(`wgpu-hal-30.0.1/src/gles/egl.rs`):
+
+```rust
+let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
+    (Some(Rdh::Wayland(h)), Some(egl)) if client_ext_str.contains("EGL_EXT_platform_wayland") => { /* Wayland */ }
+    (Some(Rdh::Xlib(h)),    Some(egl)) if client_ext_str.contains("EGL_EXT_platform_x11")     => { /* X11 */ }
+    x if client_ext_str.contains("EGL_MESA_platform_surfaceless") => { /* surfaceless */ }
+    ...
+```
+
+Surfaceless is only reached when `desc.display` is `None`. egui-wgpu passes the
+live Wayland handle (`egui-wgpu-0.36.2/src/setup.rs`), so the first arm wins.
+
+The two platforms differ in capability on this host, measured directly:
+
+| EGL platform | `image_dma_buf_export` | `image_dma_buf_import` |
+|---|---|---|
+| `EGL_PLATFORM_WAYLAND_KHR` | **no** | **no** |
+| `EGL_MESA_platform_surfaceless` | **yes** | **yes** |
+
+So the display wgpu uses has no dma-buf support at all, regardless of which
+device backs it.
+
+### No lever exists inside the application
+
+- `PHOTOCRAFT_GPU_ADAPTER` filters adapters **by name**, and wgpu-hal's GL
+  backend builds exactly one adapter from its single EGL display, so there is
+  nothing to choose between.
+- `gpu_startup.rs` sets `instance_descriptor.backends`, `.flags` and the DX12
+  compiler, but never `.display`.
+- `EGL_PLATFORM` is not read by wgpu-hal or khronos-egl (grep: no matches). It
+  only affects tools such as `eglinfo`, which is why it appears to work in a
+  manual probe and does nothing for a real client.
+- `WGPU_BACKEND=vulkan` is not an escape hatch: the host has only `lvp_icd`
+  (lavapipe, CPU). No D3D12 Vulkan ICD (`dzn`/`dozen`) is packaged.
+
+### What would have to change
+
+One of the following, all outside WaySL:
+
+1. egui-wgpu or wgpu-hal preferring `EGL_PLATFORM_SURFACELESS_MESA` when the
+   Wayland display cannot export dma-bufs.
+2. A Mesa change to offer dma-buf on the Wayland platform.
+3. A D3D12 Vulkan ICD so `WGPU_BACKEND=vulkan` reaches the GPU.
+
+WaySL's side is complete: the global is advertised only when the EGL probe
+succeeds, the format table lists every importable layout, and the tranche
+sequence is correct and accepted by the client.
+
 ## Debugging notes
 
 These are the specific traps encountered while building this, recorded so they
@@ -505,12 +575,8 @@ Known gaps:
   `EGL_MESA_device_software`. Both report `D3D12 (NVIDIA Quadro P4000)`, and the
   software-labelled one only issues `wl_shm` capability queries, so the label
   does not mean CPU rendering.
-- No client on this host imports a dma-buf: Mesa binds
-  `zwp_linux_dmabuf_v1`, consumes the feedback and then never calls
-  `create_params` or `create_immed`, allocating through `wl_shm` instead. The
-  device wgpu binds is the `wl_shm`-only, software-labelled one. Reaching the
-  dma-buf path would need wgpu to select the DRM-capable device, which is
-  outside the compositor.
+- No client on this host imports a dma-buf, and the reason is upstream of
+  WaySL. See "Why clients never import a dma-buf" above.
 - The renderer paints with a plain `Camera2d` and sprite. Custom projections,
   render layers, and non-zero transforms did not paint on the software D3D12
   adapter used in early testing, so that configuration is kept deliberately
