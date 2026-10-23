@@ -18,6 +18,7 @@ use std::io::Write as _;
 use wayland_protocols::wp::linux_dmabuf::zv1::server::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
+use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::server::{xdg_popup, xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::protocol::{
@@ -96,6 +97,10 @@ pub fn run_with_sender(
     // any subsurface is driven to a no-op instead of leaving the client without
     // server-side decorations.
     handle.create_global::<WaylandState, wl_subcompositor::WlSubcompositor, ()>(1, ());
+    // viewporter lets clients crop and scale without resizing their buffer,
+    // which is how toolkits implement fractional scaling and how video players
+    // letterbox without reallocating.
+    handle.create_global::<WaylandState, wp_viewporter::WpViewporter, ()>(1, ());
     let mut state = WaylandState {
         sender: Some(sender),
         next_serial: 0,
@@ -318,6 +323,20 @@ struct SurfaceInner {
     callbacks: Vec<wl_callback::WlCallback>,
     title: String,
     generation: u64,
+    /// Source rectangle set through `wp_viewport.set_source`, in buffer units.
+    viewport_source: Option<ViewportRect>,
+    /// Destination size set through `wp_viewport.set_destination`, in surface
+    /// units. `None` means "use the buffer size".
+    viewport_destination: Option<(i32, i32)>,
+}
+
+/// A rectangle in `wp_viewport` terms; coordinates may be fractional.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ViewportRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 type SurfaceData = Arc<Mutex<SurfaceInner>>;
@@ -496,12 +515,21 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                     && let Some(pixels) = copy_buffer(buffer_data)
                 {
                     data.generation = data.generation.wrapping_add(1);
+                    // Apply the viewport last: a client may crop and scale in the
+                    // same commit that attaches the buffer.
+                    let (frame_width, frame_height, pixels) = apply_viewport(
+                        &pixels,
+                        buffer_data.width,
+                        buffer_data.height,
+                        data.viewport_source,
+                        data.viewport_destination,
+                    );
                     if let Some(sender) = &state.sender {
                         let _ = sender.send(WaylandFrame {
                             id: data.id,
                             title: data.title.clone(),
-                            width: buffer_data.width as u32,
-                            height: buffer_data.height as u32,
+                            width: frame_width,
+                            height: frame_height,
                             pixels,
                             generation: data.generation,
                         });
@@ -1062,6 +1090,76 @@ impl Dispatch<zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1, Arc<Mutex<Dmab
     }
 }
 
+/// Crops to the viewport source rectangle and rescales to the destination size.
+///
+/// Returns the pixel buffer plus its resulting dimensions. When no viewport is
+/// set the input is passed through untouched, so surfaces that never use
+/// `wp_viewporter` pay nothing.
+fn apply_viewport(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+    source: Option<ViewportRect>,
+    destination: Option<(i32, i32)>,
+) -> (u32, u32, Vec<u8>) {
+    let (width_u, height_u) = match (u32::try_from(width), u32::try_from(height)) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => return (0, 0, pixels.to_vec()),
+    };
+    if source.is_none() && destination.is_none() {
+        return (width_u, height_u, pixels.to_vec());
+    }
+
+    // Step 1: crop. Rounded outward-ish via truncation of the offsets and
+    // rounding of the extents, which keeps the result within the buffer.
+    let (crop_x, crop_y, crop_w, crop_h) = match source {
+        Some(rect) => {
+            let x = rect.x.floor().max(0.0) as u32;
+            let y = rect.y.floor().max(0.0) as u32;
+            let w = rect.width.round().max(1.0) as u32;
+            let h = rect.height.round().max(1.0) as u32;
+            (
+                x.min(width_u.saturating_sub(1)),
+                y.min(height_u.saturating_sub(1)),
+                w,
+                h,
+            )
+        }
+        None => (0, 0, width_u, height_u),
+    };
+    let crop_w = crop_w.min(width_u - crop_x);
+    let crop_h = crop_h.min(height_u - crop_y);
+
+    let (out_w, out_h) = match destination {
+        Some((w, h)) => (
+            u32::try_from(w).unwrap_or(crop_w).max(1),
+            u32::try_from(h).unwrap_or(crop_h).max(1),
+        ),
+        None => (crop_w, crop_h),
+    };
+
+    if (crop_x, crop_y, crop_w, crop_h) == (0, 0, width_u, height_u)
+        && (out_w, out_h) == (width_u, height_u)
+    {
+        return (width_u, height_u, pixels.to_vec());
+    }
+
+    // Step 2: resample with nearest neighbour into the destination size.
+    let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    for dy in 0..out_h {
+        let sy = crop_y + (u64::from(dy) * u64::from(crop_h) / u64::from(out_h)) as u32;
+        for dx in 0..out_w {
+            let sx = crop_x + (u64::from(dx) * u64::from(crop_w) / u64::from(out_w)) as u32;
+            let src = ((sy * width_u + sx) * 4) as usize;
+            let dst = ((dy * out_w + dx) * 4) as usize;
+            if src + 4 <= pixels.len() && dst + 4 <= out.len() {
+                out[dst..dst + 4].copy_from_slice(&pixels[src..src + 4]);
+            }
+        }
+    }
+    (out_w, out_h, out)
+}
+
 /// Stores geometry on the params and maps the accumulated planes.
 fn record_and_build(
     data: &Arc<Mutex<DmabufParams>>,
@@ -1162,6 +1260,102 @@ fn anonymous_memfd(contents: &[u8]) -> Option<OwnedFd> {
     // F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL
     let _ = unsafe { fcntl(fd.as_raw_fd(), 1031, 0x0001 | 0x0002 | 0x0004 | 0x0008) };
     Some(fd)
+}
+
+// ---------------------------------------------------------------------------
+// wp_viewporter
+//
+// The renderer currently forwards one bitmap per surface unchanged, so a
+// destination size is applied by nearest-neighbour resampling and a source
+// rectangle by cropping. That is enough for the common toolkit uses (integer
+// and fractional scaling, letterboxing) without pulling in a GPU scaler.
+// ---------------------------------------------------------------------------
+
+impl GlobalDispatch<wp_viewporter::WpViewporter, ()> for WaylandState {
+    fn bind(
+        _: &mut Self,
+        _: &DisplayHandle,
+        _: &Client,
+        resource: New<wp_viewporter::WpViewporter>,
+        _: &(),
+        init: &mut DataInit<'_, Self>,
+    ) {
+        init.init(resource, ());
+    }
+}
+
+impl Dispatch<wp_viewporter::WpViewporter, ()> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wp_viewporter::WpViewporter,
+        request: wp_viewporter::Request,
+        _: &(),
+        _: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_viewporter::Request::GetViewport { id, surface } => {
+                // The viewport mutates the surface it was created for, so it
+                // shares that surface's state rather than carrying its own.
+                if let Some(data) = surface.data::<SurfaceData>() {
+                    init.init(id, data.clone());
+                }
+            }
+            wp_viewporter::Request::Destroy => {}
+            other => eprintln!("[waysl] ignoring unsupported wp_viewporter request: {other:?}"),
+        }
+    }
+}
+
+impl Dispatch<wp_viewport::WpViewport, SurfaceData> for WaylandState {
+    fn request(
+        _: &mut Self,
+        _: &Client,
+        _: &wp_viewport::WpViewport,
+        request: wp_viewport::Request,
+        data: &SurfaceData,
+        _: &DisplayHandle,
+        _: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            wp_viewport::Request::SetSource {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                if let Ok(mut surface) = data.lock() {
+                    // -1 in every component means "reset to the whole buffer".
+                    surface.viewport_source = if x < 0.0 && y < 0.0 && width < 0.0 && height < 0.0 {
+                        None
+                    } else if width > 0.0 && height > 0.0 {
+                        Some(ViewportRect {
+                            x,
+                            y,
+                            width,
+                            height,
+                        })
+                    } else {
+                        // A partially negative rectangle is a protocol error;
+                        // ignore it and keep the previous value.
+                        surface.viewport_source
+                    };
+                }
+            }
+            wp_viewport::Request::SetDestination { width, height } => {
+                if let Ok(mut surface) = data.lock() {
+                    surface.viewport_destination = if width <= 0 || height <= 0 {
+                        None
+                    } else {
+                        Some((width, height))
+                    };
+                }
+            }
+            wp_viewport::Request::Destroy => {}
+            other => eprintln!("[waysl] ignoring unsupported wp_viewport request: {other:?}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1309,6 +1503,83 @@ mod tests {
             }
             .is_opaque()
         );
+    }
+
+    /// Builds a width x height RGBA buffer where each pixel encodes its column.
+    fn columns(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let at = ((y * width + x) * 4) as usize;
+                pixels[at] = x as u8;
+                pixels[at + 3] = 0xff;
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn viewport_passthrough_does_not_copy_or_resize() {
+        let pixels = columns(4, 2);
+        let (w, h, out) = apply_viewport(&pixels, 4, 2, None, None);
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(out, pixels);
+    }
+
+    #[test]
+    fn viewport_source_crops() {
+        let pixels = columns(4, 2);
+        let source = ViewportRect {
+            x: 1.0,
+            y: 0.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        let (w, h, out) = apply_viewport(&pixels, 4, 2, Some(source), None);
+        assert_eq!((w, h), (2, 2));
+        // Cropped columns 1 and 2.
+        assert_eq!(out[0], 1);
+        assert_eq!(out[4], 2);
+    }
+
+    #[test]
+    fn viewport_destination_scales() {
+        let pixels = columns(2, 2);
+        let (w, h, out) = apply_viewport(&pixels, 2, 2, None, Some((4, 4)));
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(out.len(), 4 * 4 * 4);
+        // Nearest neighbour doubles each column.
+        assert_eq!(out[0], 0);
+        assert_eq!(out[4], 0);
+        assert_eq!(out[8], 1);
+    }
+
+    #[test]
+    fn viewport_crop_and_scale_compose() {
+        let pixels = columns(4, 4);
+        let source = ViewportRect {
+            x: 2.0,
+            y: 2.0,
+            width: 2.0,
+            height: 2.0,
+        };
+        let (w, h, out) = apply_viewport(&pixels, 4, 4, Some(source), Some((1, 1)));
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out[0], 2);
+    }
+
+    #[test]
+    fn viewport_source_is_clamped_to_buffer() {
+        let pixels = columns(4, 2);
+        let source = ViewportRect {
+            x: 3.0,
+            y: 1.0,
+            width: 99.0,
+            height: 99.0,
+        };
+        let (w, h, out) = apply_viewport(&pixels, 4, 2, Some(source), None);
+        assert_eq!((w, h), (1, 1));
+        assert_eq!(out[0], 3);
     }
 
     #[test]

@@ -40,6 +40,8 @@ Two pieces of state travel between them, and they are deliberately separate:
 | `wl_output` | 3 | geometry, mode, scale, name |
 | `zxdg_toplevel_decoration_v1` | 1 | replies `client_side` |
 | `zwp_linux_dmabuf_v1` | 4 | **only when the EGL probe succeeds** |
+| `wl_subcompositor` | 1 | accepted; subsurface content is a no-op |
+| `wp_viewporter` | 1 | source crop and destination scaling are applied |
 
 `zwp_linux_dmabuf_v1` is gated on a runtime EGL probe so a host without a
 usable GPU simply does not offer it, and clients fall back to `wl_shm` instead
@@ -205,6 +207,18 @@ The three files cover login shells, systemd units, and `wsl -- cmd`
 respectively. Verify with `eglinfo -B | grep D3D12`, which should report
 `D3D12 (NVIDIA Quadro P4000)` rather than `llvmpipe`.
 
+`tools/setup-wsl2-gpu.sh` automates this instead of copying the snippet by
+hand:
+
+```sh
+sudo ./tools/setup-wsl2-gpu.sh            # install
+./tools/setup-wsl2-gpu.sh --check         # verify, exit 1 when absent
+sudo ./tools/setup-wsl2-gpu.sh --uninstall
+```
+
+Re-running the installer is idempotent: an existing `GALLIUM_DRIVER` line in
+`/etc/environment` is replaced rather than duplicated.
+
 Applications also cache their own GPU decision: PhotoCraft writes
 `~/.config/photocraft/gpu-starting.json`, and after a failed start it records
 `"backend":"cpu"` and stops retrying. Delete that file after fixing the driver
@@ -338,7 +352,7 @@ Windows desktop.
 | `Connection refused` to the bridge | WSL2 NAT | Add the portproxy |
 | Renderer runs, no window appears | Task ran in session 0 | Use `-LogonType Interactive` |
 | `was blocked by ... Device Guard policy` | Smart App Control | Sign the binary |
-| `Subcompositor protocol not available` | Expected — WaySL does not offer it | Harmless; CSD falls back |
+| `Subcompositor protocol not available` | Only on builds before `wl_subcompositor` was added | Update WaySL |
 | `arboard ... clipboard` warnings | Expected — no data-control protocol | Harmless |
 
 ## Debugging notes
