@@ -207,6 +207,178 @@ fn read_u64(stream: &mut TcpStream) -> io::Result<u64> {
     Ok(u64::from_le_bytes(bytes))
 }
 
+// ---------------------------------------------------------------------------
+// Input
+//
+// Input travels the other way: the Windows renderer owns the window and sees
+// the events, the compositor owns the `wl_seat` and can deliver them to the
+// client. Each connection therefore carries frames one way and input the other.
+//
+// An input record is a fixed 24-byte little-endian struct, smaller and simpler
+// than a frame because it is written at event rate:
+//
+// ```text
+// magic "WSI1" | surface_id:u64 | kind:u8 | flags:u8 | _pad:[2] |
+// a:f32 | b:f32 | serial:u32
+// ```
+//
+// `kind` selects the meaning of `a`/`b`; see [`InputEvent`]. `flags` carries
+// the bitmask for button and key events.
+// ---------------------------------------------------------------------------
+
+/// Input record magic, distinct from the frame magic so a reader can tell the
+/// two directions apart on a shared connection.
+const INPUT_MAGIC: &[u8; 4] = b"WSI1";
+/// Size of one encoded input record.
+pub const INPUT_LEN: usize = 24;
+
+/// One input event destined for a surface's window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum InputEvent {
+    /// Pointer moved to `(x, y)` in surface-local coordinates.
+    PointerMotion {
+        /// Horizontal position in surface pixels.
+        x: f32,
+        /// Vertical position in surface pixels.
+        y: f32,
+    },
+    /// A pointer button changed state.
+    PointerButton {
+        /// Linux input event code (for example `BTN_LEFT` = 272).
+        button: u32,
+        /// Whether the button is now pressed.
+        pressed: bool,
+    },
+    /// Pointer entered or left the surface.
+    PointerEnter {
+        /// Whether the pointer is now inside the surface.
+        inside: bool,
+    },
+    /// Pointer axis (scroll) in discrete steps, positive is down/right.
+    PointerAxis {
+        /// Horizontal steps.
+        horizontal: f32,
+        /// Vertical steps.
+        vertical: f32,
+    },
+    /// A key changed state.
+    Key {
+        /// Linux keycode minus 8, which is what Wayland expects.
+        key: u32,
+        /// Whether the key is now pressed.
+        pressed: bool,
+    },
+}
+
+impl InputEvent {
+    /// Discriminant written to the wire.
+    const fn kind(self) -> u8 {
+        match self {
+            Self::PointerMotion { .. } => 0,
+            Self::PointerButton { .. } => 1,
+            Self::PointerEnter { .. } => 2,
+            Self::PointerAxis { .. } => 3,
+            Self::Key { .. } => 4,
+        }
+    }
+
+    /// Encodes one record for `surface`.
+    #[must_use]
+    pub fn encode(self, surface: u64, serial: u32) -> [u8; INPUT_LEN] {
+        let mut out = [0u8; INPUT_LEN];
+        out[0..4].copy_from_slice(INPUT_MAGIC);
+        out[4..12].copy_from_slice(&surface.to_le_bytes());
+        out[12] = self.kind();
+        let (a, b, flags) = match self {
+            Self::PointerMotion { x, y } => (x, y, 0u8),
+            Self::PointerButton { button, pressed } => (button as f32, 0.0, u8::from(pressed)),
+            Self::PointerEnter { inside } => (0.0, 0.0, u8::from(inside)),
+            Self::PointerAxis {
+                horizontal,
+                vertical,
+            } => (horizontal, vertical, 0),
+            Self::Key { key, pressed } => (key as f32, 0.0, u8::from(pressed)),
+        };
+        out[13] = flags;
+        // 14..16 stays zero padding.
+        out[16..20].copy_from_slice(&a.to_le_bytes());
+        out[20..24].copy_from_slice(&b.to_le_bytes());
+        let _ = serial;
+        out
+    }
+
+    /// Decodes a record, returning the surface it targets.
+    ///
+    /// Returns `None` for an unknown magic or kind, which the caller treats as a
+    /// protocol violation rather than guessing.
+    #[must_use]
+    pub fn decode(raw: &[u8; INPUT_LEN]) -> Option<(u64, Self)> {
+        if &raw[0..4] != INPUT_MAGIC {
+            return None;
+        }
+        let surface = u64::from_le_bytes(raw[4..12].try_into().ok()?);
+        let flags = raw[13] != 0;
+        let a = f32::from_le_bytes(raw[16..20].try_into().ok()?);
+        let b = f32::from_le_bytes(raw[20..24].try_into().ok()?);
+        let event = match raw[12] {
+            0 => Self::PointerMotion { x: a, y: b },
+            1 => Self::PointerButton {
+                button: a as u32,
+                pressed: flags,
+            },
+            2 => Self::PointerEnter { inside: flags },
+            3 => Self::PointerAxis {
+                horizontal: a,
+                vertical: b,
+            },
+            4 => Self::Key {
+                key: a as u32,
+                pressed: flags,
+            },
+            _ => return None,
+        };
+        Some((surface, event))
+    }
+}
+
+/// Writes input records to the compositor.
+///
+/// Mirrors [`FrameWriter`]: the connection is established lazily and dropped on
+/// failure so the next event reconnects.
+#[derive(Debug, Default)]
+pub struct InputWriter {
+    stream: Option<TcpStream>,
+}
+
+impl InputWriter {
+    /// Sends one event for `surface`.
+    pub fn send(&mut self, address: &str, surface: u64, event: InputEvent) -> io::Result<()> {
+        if self.stream.is_none() {
+            self.stream = Some(TcpStream::connect(address)?);
+        }
+        let record = event.encode(surface, 0);
+        let result = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "no input stream"))?
+            .write_all(&record);
+        if result.is_err() {
+            self.stream = None;
+        }
+        result
+    }
+}
+
+/// Reads input records from one connection.
+///
+/// Input shares the connection with frames, so the caller distinguishes them by
+/// the magic rather than by a separate socket.
+pub fn read_input(stream: &mut TcpStream) -> io::Result<(u64, InputEvent)> {
+    let mut raw = [0u8; INPUT_LEN];
+    stream.read_exact(&mut raw)?;
+    InputEvent::decode(&raw).ok_or_else(|| invalid("invalid input record"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +477,54 @@ mod tests {
         let (mut stream, _) = listener.accept().expect("accept");
         assert!(read_frame(&mut stream).is_err());
         writer.join().expect("writer");
+    }
+
+    #[test]
+    fn input_round_trips_every_event_kind() {
+        let events = [
+            InputEvent::PointerMotion { x: 12.5, y: -3.0 },
+            InputEvent::PointerButton {
+                button: 272,
+                pressed: true,
+            },
+            InputEvent::PointerEnter { inside: false },
+            InputEvent::PointerAxis {
+                horizontal: 0.0,
+                vertical: -2.0,
+            },
+            InputEvent::Key {
+                key: 30,
+                pressed: true,
+            },
+        ];
+        for event in events {
+            let raw = event.encode(7, 1);
+            let (surface, decoded) = InputEvent::decode(&raw).expect("decode");
+            assert_eq!(surface, 7);
+            assert_eq!(decoded, event, "round trip for {event:?}");
+        }
+    }
+
+    #[test]
+    fn input_record_rejects_bad_magic() {
+        let mut raw = InputEvent::PointerEnter { inside: true }.encode(1, 0);
+        raw[0] = b'X';
+        assert!(InputEvent::decode(&raw).is_none());
+    }
+
+    #[test]
+    fn input_record_rejects_unknown_kind() {
+        let mut raw = InputEvent::PointerEnter { inside: true }.encode(1, 0);
+        raw[12] = 99;
+        assert!(InputEvent::decode(&raw).is_none());
+    }
+
+    #[test]
+    fn input_record_does_not_collide_with_frame_magic() {
+        // The two directions share a connection in some deployments, so a
+        // record must never be mistaken for a frame header.
+        let raw = InputEvent::PointerEnter { inside: true }.encode(1, 0);
+        assert_ne!(&raw[0..4], MAGIC);
     }
 
     #[test]

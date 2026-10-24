@@ -1,5 +1,6 @@
 //! Native Bevy renderer: one window per forwarded Wayland surface.
 
+mod input;
 mod placeholder;
 mod surfaces;
 mod waypipe;
@@ -29,6 +30,7 @@ pub fn run(config: &Config) -> std::io::Result<()> {
         close_when_requested: false,
         ..default()
     }));
+    app.insert_resource(input::InputForwarder::new(config.input_forward.clone()));
     app.add_systems(Startup, placeholder::startup);
     app.add_systems(
         Update,
@@ -36,6 +38,12 @@ pub fn run(config: &Config) -> std::io::Result<()> {
             surfaces::receive_frames,
             surfaces::sync_windows,
             surfaces::upload_frames,
+            (
+                input::forward_cursor,
+                input::forward_buttons,
+                input::forward_wheel,
+                input::forward_keys,
+            ),
         )
             .chain(),
     );

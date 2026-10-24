@@ -34,6 +34,10 @@ pub struct Config {
     pub wayland_tcp: String,
     /// Optional Waypipe command launched by the renderer (`WAYSL_WAYPIPE_COMMAND`).
     pub waypipe_command: Option<String>,
+    /// Where the renderer sends forwarded input (`WAYSL_INPUT_FORWARD`), and
+    /// where the compositor listens for it (`WAYSL_INPUT_LISTEN`). Unset on
+    /// either side disables input.
+    pub input_forward: Option<String>,
 }
 
 impl Config {
@@ -49,6 +53,7 @@ impl Config {
             wayland_tcp: non_empty("WAYSL_WAYLAND_TCP")
                 .unwrap_or_else(|| DEFAULT_WAYLAND_TCP.to_string()),
             waypipe_command: non_empty("WAYSL_WAYPIPE_COMMAND"),
+            input_forward: non_empty("WAYSL_INPUT_FORWARD"),
         }
     }
 
@@ -83,6 +88,7 @@ mod tests {
             frame_bridge: DEFAULT_FRAME_BRIDGE.to_string(),
             wayland_tcp: DEFAULT_WAYLAND_TCP.to_string(),
             waypipe_command: None,
+            input_forward: None,
         };
         assert!(!config.is_headless());
     }

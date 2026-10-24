@@ -121,6 +121,8 @@ after `--`.
 | `WAYSL_LISTEN` | `127.0.0.1:48765` | renderer frame bridge (bind address) |
 | `WAYSL_WAYLAND_TCP` | `127.0.0.1:48766` | Windows TCP framing endpoint (experimental) |
 | `WAYSL_WAYPIPE_COMMAND` | unset | optional Waypipe launch from the single-process mode |
+| `WAYSL_INPUT_FORWARD` | unset | renderer: where to send input; unset disables input |
+| `WAYSL_INPUT_LISTEN` | unset | compositor: where to receive input; unset disables input |
 
 ## Frame bridge format
 
@@ -424,6 +426,62 @@ One of the following, all outside WaySL:
 WaySL's side is complete: the global is advertised only when the EGL probe
 succeeds, the format table lists every importable layout, and the tranche
 sequence is correct and accepted by the client.
+
+
+## Input
+
+Input travels the opposite way from frames: the renderer owns the window and
+sees the events, while the compositor owns the `wl_seat` and delivers them.
+
+```text
+Windows window ──► renderer ──WSI1 records──► compositor ──► wl_seat events
+```
+
+Enable it by naming both addresses:
+
+```sh
+# compositor side
+WAYSL_INPUT_LISTEN=172.22.240.1:48767 ...
+
+# renderer side
+WAYSL_INPUT_FORWARD=127.0.0.1:48767 ...
+```
+
+Either one unset disables input entirely, so existing deployments are
+unaffected.
+
+An input record is a fixed 24-byte little-endian struct:
+
+```text
+magic "WSI1" | surface_id:u64 | kind:u8 | flags:u8 | padding:[2] |
+a:f32 | b:f32 | serial:u32
+```
+
+`kind` selects the event (0 motion, 1 button, 2 enter/leave, 3 axis, 4 key),
+`flags` is the pressed bit for button and key events, and `a`/`b` carry the
+coordinates or the code and value. The magic differs from the frame magic so
+the two directions can share a connection.
+
+What is forwarded today:
+
+| Input | Wire | Notes |
+|---|---|---|
+| Cursor motion | `PointerMotion` | window coordinates, unchanged |
+| Buttons | `PointerButton` | left/right/middle only |
+| Scroll wheel | `PointerAxis` | sent to the focused surface |
+| Keys | `Key` | printable ASCII, editing, modifiers, F-keys, keypad |
+
+Two limitations are deliberate, not oversights:
+
+- **No `pointer.enter`/`leave`.** Those events name a surface, and the
+  forwarder does not track which surface the cursor is over, so motion is
+  delivered to every surface that created a pointer. Clients accept motion
+  without a preceding enter, but they cannot show a hover state or a custom
+  cursor until this is added.
+- **Keymap is not sent.** `wl_keyboard.key` carries a Linux keycode, and a real
+  client resolves it through the keymap from `wl_keyboard.keymap`. PhotoCraft's
+  toolkit synthesises its own, but a client that relies on the compositor's
+  keymap will not receive one yet.
 
 ## Debugging notes
 

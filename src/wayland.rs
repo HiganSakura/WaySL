@@ -60,11 +60,120 @@ pub struct WaylandFrame {
     pub generation: u64,
 }
 
-/// Per-client state shared across all dispatch implementations.
+impl WaylandState {
+    /// Delivers one forwarder input event to every live client device.
+    ///
+    /// Clients only receive events for devices they created, so a client that
+    /// never called `get_pointer` simply has no pointer to notify.
+    pub fn deliver_input(&mut self, event: crate::frame_bridge::InputEvent) {
+        use crate::frame_bridge::InputEvent;
+
+        // Service clocks only need to be monotonic; Wayland uses them so clients
+        // can coalesce redraws within a frame.
+        let time = u32::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+                % u128::from(u32::MAX),
+        )
+        .unwrap_or(0);
+
+        match event {
+            InputEvent::PointerMotion { x, y } => {
+                self.pointers.retain(|weak| {
+                    let Ok(pointer) = weak.upgrade() else {
+                        return false;
+                    };
+                    // Wayland passes pointer coordinates as 24.8 fixed point.
+                    pointer.motion(time, (x * 256.0) as f64, (y * 256.0) as f64);
+                    true
+                });
+            }
+            InputEvent::PointerButton { button, pressed } => {
+                self.bump_serial();
+                let serial = self.next_serial;
+                let state = if pressed {
+                    wl_pointer::ButtonState::Pressed
+                } else {
+                    wl_pointer::ButtonState::Released
+                };
+                self.pointers.retain(|weak| {
+                    let Ok(pointer) = weak.upgrade() else {
+                        return false;
+                    };
+                    pointer.button(serial, time, button, state);
+                    true
+                });
+            }
+            InputEvent::PointerAxis {
+                horizontal,
+                vertical,
+            } => {
+                self.pointers.retain(|weak| {
+                    let Ok(pointer) = weak.upgrade() else {
+                        return false;
+                    };
+                    // Axis values arrive in world units; the protocol wants
+                    // 24.8 fixed point, and v120 is the wheel-based alternative.
+                    if vertical != 0.0 {
+                        pointer.axis(
+                            time,
+                            wl_pointer::Axis::VerticalScroll,
+                            (vertical * 256.0) as f64,
+                        );
+                    }
+                    if horizontal != 0.0 {
+                        pointer.axis(
+                            time,
+                            wl_pointer::Axis::HorizontalScroll,
+                            (horizontal * 256.0) as f64,
+                        );
+                    }
+                    true
+                });
+            }
+            InputEvent::PointerEnter { .. } => {
+                // Enter and leave need a surface to name, which the forwarder
+                // does not track yet; motion is delivered regardless.
+            }
+            InputEvent::Key { key, pressed } => {
+                self.bump_serial();
+                let serial = self.next_serial;
+                let state = if pressed {
+                    wl_keyboard::KeyState::Pressed
+                } else {
+                    wl_keyboard::KeyState::Released
+                };
+                self.keyboards.retain(|weak| {
+                    let Ok(keyboard) = weak.upgrade() else {
+                        return false;
+                    };
+                    keyboard.key(serial, time, key, state);
+                    true
+                });
+            }
+        }
+    }
+
+    /// Advances the event serial, skipping zero, which some clients treat as
+    /// "no serial".
+    fn bump_serial(&mut self) {
+        self.next_serial = self.next_serial.wrapping_add(1).max(1);
+    }
+}
+
 #[derive(Default)]
 pub struct WaylandState {
     sender: Option<mpsc::Sender<WaylandFrame>>,
     next_serial: u32,
+    /// Seat resources handed to clients, so forwarded input can be offered to
+    /// each of them. Weak because the server owns their lifetime.
+    seats: Vec<wayland_server::Weak<wl_seat::WlSeat>>,
+    /// Pointer objects created from a seat; input events target these.
+    pointers: Vec<wayland_server::Weak<wl_pointer::WlPointer>>,
+    /// Keyboard objects created from a seat.
+    keyboards: Vec<wayland_server::Weak<wl_keyboard::WlKeyboard>>,
 }
 
 pub fn run_with_sender(
@@ -107,7 +216,12 @@ pub fn run_with_sender(
     let mut state = WaylandState {
         sender: Some(sender),
         next_serial: 0,
+        seats: Vec::new(),
+        pointers: Vec::new(),
+        keyboards: Vec::new(),
     };
+
+    let input = input_channel();
 
     loop {
         loop {
@@ -121,10 +235,61 @@ pub fn run_with_sender(
                 Err(error) => return Err(error),
             }
         }
+        // Input is drained before dispatch so a burst of events reaches the
+        // client in the same tick it was queued.
+        while let Ok(event) = input.try_recv() {
+            state.deliver_input(event);
+        }
         display.dispatch_clients(&mut state)?;
         display.flush_clients()?;
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Listens for input forwarded by the renderer.
+///
+/// Returns an empty receiver when `WAYSL_INPUT_LISTEN` is unset, so running
+/// without input support costs nothing and needs no extra port.
+fn input_channel() -> mpsc::Receiver<crate::frame_bridge::InputEvent> {
+    let (sender, receiver) = mpsc::channel();
+    let Some(address) = std::env::var("WAYSL_INPUT_LISTEN")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return receiver;
+    };
+    thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind(&address) {
+            Ok(listener) => listener,
+            Err(error) => {
+                eprintln!("WaySL input listener failed on {address}: {error}");
+                return;
+            }
+        };
+        eprintln!("WaySL input listening on {address}");
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                continue;
+            };
+            let sender = sender.clone();
+            thread::spawn(move || {
+                loop {
+                    let mut raw = [0u8; crate::frame_bridge::INPUT_LEN];
+                    if std::io::Read::read_exact(&mut stream, &mut raw).is_err() {
+                        return;
+                    }
+                    let Some((_, event)) = crate::frame_bridge::InputEvent::decode(&raw) else {
+                        eprintln!("[waysl] dropping malformed input record");
+                        return;
+                    };
+                    if sender.send(event).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    receiver
 }
 
 struct ShmPool {
@@ -761,7 +926,7 @@ impl Dispatch<wl_region::WlRegion, ()> for WaylandState {
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
     fn bind(
-        _: &mut Self,
+        state: &mut Self,
         _: &DisplayHandle,
         _: &Client,
         resource: New<wl_seat::WlSeat>,
@@ -769,6 +934,7 @@ impl GlobalDispatch<wl_seat::WlSeat, ()> for WaylandState {
         init: &mut DataInit<'_, Self>,
     ) {
         let seat = init.init(resource, ());
+        state.seats.push(seat.downgrade());
         seat.capabilities(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard);
     }
 }
@@ -785,10 +951,12 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandState {
     ) {
         match request {
             wl_seat::Request::GetPointer { id } => {
-                init.init(id, ());
+                let pointer = init.init(id, ());
+                state.pointers.push(pointer.downgrade());
             }
             wl_seat::Request::GetKeyboard { id } => {
-                init.init(id, ());
+                let keyboard = init.init(id, ());
+                state.keyboards.push(keyboard.downgrade());
             }
             wl_seat::Request::GetTouch { .. } | wl_seat::Request::Release => {}
             _ => {

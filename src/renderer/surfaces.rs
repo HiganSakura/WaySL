@@ -36,7 +36,8 @@ pub struct Surface {
 #[derive(Resource, Default)]
 pub struct SurfaceRegistry {
     surfaces: HashMap<SurfaceId, Surface>,
-    windows: HashMap<SurfaceId, Entity>,
+    /// Windows created for a surface, used to route input back to it.
+    pub windows: HashMap<SurfaceId, Entity>,
     images: HashMap<SurfaceId, Handle<Image>>,
     generations: HashMap<SurfaceId, u64>,
 }
